@@ -73,6 +73,7 @@ func databaseFor(name string, v any) string {
 		text += " " + strings.ToLower(t.PkgPath()+"."+t.Name())
 	}
 	for _, guess := range []struct{ db, words string }{
+		{"clickhouse", "clickhouse"},
 		{"postgresql", "pgx postgres lib/pq cockroach"},
 		{"mariadb", "mariadb"},
 		{"mysql", "mysql"},

@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 )
 
 // AddBreadcrumb adds a step of your own to the trail shown before an error
@@ -23,13 +24,19 @@ func (p *Platform) AddBreadcrumb(ctx context.Context, text string) {
 
 // Transport records the outgoing requests made through it as steps of the
 // trail of the request or job their context belongs to (method, address and
-// status, never a header or a body). base nil is http.DefaultTransport:
+// status, never a header or a body), and times each one for Server speed ->
+// Calls by the host it went to (calls.go). base nil is http.DefaultTransport,
+// which is used as it is, never changed:
 //
 //	client := &http.Client{Transport: p.Transport(nil)}
 //	req, _ := http.NewRequestWithContext(r.Context(), "GET", url, nil)
 func (p *Platform) Transport(base http.RoundTripper) http.RoundTripper {
 	if base == nil {
 		base = http.DefaultTransport
+	}
+	// Wrapped twice, every call would count twice.
+	if t, ok := base.(*breadcrumbTransport); ok && t.p == p {
+		return t
 	}
 	return &breadcrumbTransport{p: p, base: base}
 }
@@ -39,30 +46,60 @@ type breadcrumbTransport struct {
 	base http.RoundTripper
 }
 
+// CloseIdleConnections passes http.Client.CloseIdleConnections on to base.
+func (t *breadcrumbTransport) CloseIdleConnections() {
+	if c, ok := t.base.(interface{ CloseIdleConnections() }); ok {
+		c.CloseIdleConnections()
+	}
+}
+
 func (t *breadcrumbTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	p := t.p
+	if p == nil || req == nil || req.URL == nil {
+		return t.base.RoundTrip(req)
+	}
 	st := stateFrom(req.Context())
-	if st == nil || t.p == nil || t.p.errors == nil || req.URL == nil {
+	crumbs := st != nil && p.errors != nil
+	timed := p.calls != nil && p.core.isOn(ModulePerformance)
+	if !crumbs && !timed {
 		return t.base.RoundTrip(req)
 	}
 	address := req.URL.Scheme + "://" + req.URL.Host + req.URL.EscapedPath()
 	// The collector's own address and what's under it are the package's
-	// calls, not steps of the request.
-	if c := t.p.core.endpoint; c != "" && (address == c || strings.HasPrefix(address, c+"/")) {
+	// calls, not steps of the request, nor the site's calls.
+	if c := p.core.endpoint; c != "" && (address == c || strings.HasPrefix(address, c+"/")) {
 		return t.base.RoundTrip(req)
 	}
+	host := ""
+	if timed {
+		host = callHost(req.URL)
+		if host == "" || host == p.core.ownHost {
+			timed = false
+		}
+	}
+	started := time.Now()
+	// RoundTrip returns once the response's headers are in: what the code
+	// waited for. A body read afterwards isn't counted.
 	res, err := t.base.RoundTrip(req)
+	elapsed := time.Since(started)
 	func() {
 		defer func() { recover() }()
 		status := 0
 		if err != nil {
-			// Cancelled by the app, as the tracker treats a cancelled fetch: not a failure.
+			// Cancelled by the app, as the tracker treats a cancelled fetch:
+			// not a failure, and not a call.
 			if errors.Is(err, context.Canceled) {
 				return
 			}
-		} else {
+		} else if res != nil {
 			status = res.StatusCode
 		}
-		st.addCrumb("request", strings.ToUpper(firstNonEmpty(req.Method, "GET"))+" "+address, &status)
+		if timed {
+			p.recordCall(req.Context(), req.Method, host, elapsed, status)
+		}
+		if crumbs {
+			st.addCrumb("request", strings.ToUpper(firstNonEmpty(req.Method, "GET"))+" "+address, &status)
+		}
 	}()
 	return res, err
 }

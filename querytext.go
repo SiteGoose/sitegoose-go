@@ -26,9 +26,19 @@ const (
 
 // databases a row may name; anything else is "other".
 var databases = map[string]bool{"postgresql": true, "mysql": true, "mariadb": true, "sqlite": true, "mssql": true,
-	"oracle": true, "mongodb": true, "other": true}
+	"oracle": true, "clickhouse": true, "mongodb": true, "other": true}
 
+// databaseOf lower-cases as JavaScript's toLowerCase does for these names:
+// the Kelvin sign is a k, but İ is "i̇" (two characters) where Go's
+// strings.ToLower makes it an i, so "SQLİTE" stays "other" as in the
+// reference. No other non-ASCII character lower-cases to a letter of a name.
 func databaseOf(db string) string {
+	db = strings.ReplaceAll(db, "K", "k")
+	for i := 0; i < len(db); i++ {
+		if db[i] >= 0x80 {
+			return "other"
+		}
+	}
 	db = strings.ToLower(db)
 	if databases[db] {
 		return db
@@ -93,14 +103,14 @@ func qIndexFrom(r []rune, sub []rune, from int) int {
 }
 
 // qQuoteEnd is the index after the quoted run starting at start (its opening
-// quote), or the text's length when it never closes. A doubled quote and a
-// backslash both escape.
-func qQuoteEnd(r []rune, start int, quote rune) int {
+// quote), or the text's length when it never closes. A doubled quote
+// escapes, and a backslash too unless backslash is false.
+func qQuoteEnd(r []rune, start int, quote rune, backslash bool) int {
 	i := start + 1
 	for i < len(r) {
 		c := r[i]
 		switch {
-		case c == '\\':
+		case c == '\\' && backslash:
 			i += 2
 		case c == quote:
 			if qAt(r, i+1) == quote {
@@ -191,9 +201,24 @@ func qStrPrefix(c rune) bool {
 	return false
 }
 
+// backslashLiteral reports where a backslash in a string is just a
+// character: PostgreSQL's plain strings (standard_conforming_strings, on
+// since 9.1), SQLite, SQL Server and Oracle. Read as an escape there, 'C:\'
+// ends late and lets what follows out. MySQL, MariaDB, ClickHouse and unknown
+// databases escape.
+func backslashLiteral(db string) bool {
+	return db == "postgresql" || db == "sqlite" || db == "mssql" || db == "oracle"
+}
+
 func sqlShape(sql, db string) string {
+	return sqlShapeAs(sql, db, backslashLiteral(db))
+}
+
+// sqlShapeAs is sqlShape with the backslash rule given.
+func sqlShapeAs(sql, db string, literal bool) string {
 	r := []rune(sql)
 	mysql := db == "mysql" || db == "mariadb"
+	postgres := db == "postgresql"
 	out := make([]rune, 0, len(r))
 	space := func() {
 		if len(out) > 0 && out[len(out)-1] != ' ' {
@@ -219,14 +244,18 @@ func sqlShape(sql, db string) string {
 			}
 			space()
 		case c == '\'' || (c == '"' && mysql):
+			n := len(out)
+			lone := n > 0 && (n == 1 || !qIsAlnum(out[n-2]))
+			// Only PostgreSQL's E'..' escapes with a backslash where it is literal.
+			escapes := !literal || (postgres && lone && (out[n-1] == 'E' || out[n-1] == 'e'))
 			// A one-letter prefix (E'..' N'..' X'..' B'..') goes with the string.
-			if n := len(out); n > 0 && qStrPrefix(out[n-1]) && (n == 1 || !qIsAlnum(out[n-2])) {
+			if lone && qStrPrefix(out[n-1]) {
 				out = out[:n-1]
 			}
-			i = qQuoteEnd(r, i, c)
+			i = qQuoteEnd(r, i, c, escapes)
 			out = append(out, '?')
 		case c == '"' || c == '`':
-			end := qQuoteEnd(r, i, c)
+			end := qQuoteEnd(r, i, c, !literal)
 			out = append(out, r[i:end]...)
 			i = end
 		case c == '$' && !qIsWord(prev) && qDollarTag(r, i) > 0:
@@ -438,6 +467,17 @@ func normalizeStatement(text, db string) string {
 	db = databaseOf(db)
 	if db == "mongodb" {
 		return cutStatement(mongoStatement(text))
+	}
+	if db == "other" && strings.ContainsRune(text, '\\') {
+		// A database we don't know may or may not take a backslash as an
+		// escape, and each reading leaks what the other hides. When they
+		// disagree the query keeps its timing under (other) and its text is
+		// left out.
+		escaped := sqlShapeAs(text, db, false)
+		if escaped != sqlShapeAs(text, db, true) {
+			return cutStatement(otherStatement)
+		}
+		return cutStatement(escaped)
 	}
 	return cutStatement(sqlShape(text, db))
 }

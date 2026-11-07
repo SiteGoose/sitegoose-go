@@ -77,10 +77,10 @@ never stops a request.
 
 | Module | What | Options |
 | --- | --- | --- |
-| `firewall` | Allow/deny/lists/shared/banned/goodbots, probes, request rules, rate limit and local bans, the browser check, failed logins (`p.LoginFailed(r)`). IPv6 is counted and banned here by its /64; a page's own files (.css, .js, images, fonts) don't count towards the rate | `Firewall: FirewallOptions{Mode, CacheFile, TrustProxy, Counter, Skip, OnBlock}` |
+| `firewall` | Allow/deny/lists/shared/banned/goodbots, probes, request rules, page limits (429 with the limit's own `Retry-After`, never a ban), rate limit and local bans, the browser check, failed logins (`p.LoginFailed(r)`). IPv6 is counted and banned here by its /64; a page's own files (.css, .js, images, fonts) don't count towards the rate | `Firewall: FirewallOptions{Mode, CacheFile, TrustProxy, Counter, Skip, OnBlock}` |
 | `errors` | Panics, 5xx answers, `p.CaptureError(ctx, err)`, `p.Recover(ctx)` in goroutines, `p.Job`, `p.SlogHandler`, breadcrumbs (`p.AddBreadcrumb`, `p.Transport`) | `Errors: ErrorsOptions{Release, Root, SpoolDir, ShouldCapture, BeforeSend, ...}` |
-| `performance` | Server speed: per minute, method, route and status, and the database queries each route ran (below) | `Performance: PerformanceOptions{Route, DisableQueries}` |
-| `crawlers` | Health → Crawlers | |
+| `performance` | Server speed: per minute, method, route and status, and the database queries, outgoing calls and job queues behind them (below) | `Performance: PerformanceOptions{Route, DisableQueries, DisableCalls, DisableQueues}` |
+| `crawlers` | Off-site → Crawlers | |
 | `analytics` | `p.Track`, `p.Identify`, `p.Lead` | |
 | `forms` | `p.CheckForm(r, o)`, `p.ProtectForm(o, onSpam)` | |
 | `headers` | The dashboard's security headers, unless the app sets them | |
@@ -89,7 +89,7 @@ never stops a request.
 | `maintenance` | The "back soon" page, allowed addresses, preview link | `Maintenance: MaintenanceOptions{Skip}` |
 | `inventory` | The binary's Go modules (from its build info) and Go version | `Inventory: InventoryOptions{Host}` |
 | `posture` | Runs as root, writable code (the binary too), net/http/pprof on the default mux, exposed files in `./public` and `./static` | `Posture: PostureOptions{Roots, Checks}` |
-| `resources` | CPU, load, memory, disks, network (Linux /proc) | |
+| `resources` | CPU, load, memory, disks, network (Linux /proc), and how close the app is to a limit (below) | |
 | `proxy` | The tracker and its beacon on the site's own domain: `p.Proxy().ScriptURL("")`, `p.Proxy().CollectURL()`. Denied and banned addresses are turned away first; a held tracker file is served at once and refreshed behind it; beacons time out after 3 s, and after five failures in a row are answered at once for 30 s | `Proxy: ProxyOptions{Prefix}` |
 
 ## Database queries
@@ -113,10 +113,22 @@ config.ConnConfig.Tracer = sitegoosepgx.Tracer(p)
 
 // MongoDB driver v2: go get github.com/sitegoose/sitegoose-go/mongo
 client, err := mongo.Connect(options.Client().ApplyURI(uri).SetMonitor(sitegoosemongo.Monitor(p)))
+
+// ClickHouse (clickhouse-go v2), its native API: go get github.com/sitegoose/sitegoose-go/clickhouse
+conn, err := clickhouse.Open(&clickhouse.Options{Addr: []string{"127.0.0.1:9000"}})
+conn = sitegooseclickhouse.Wrap(p, conn)
 ```
 
 The database is told from the driver (`pgx`, `postgres`, `mysql`, `sqlite3`,
-`sqlite`, `sqlserver`, `godror`...). A database/sql query is timed until the
+`sqlite`, `sqlserver`, `godror`, `clickhouse`...): ClickHouse through
+database/sql (`sitegoose.OpenDB("clickhouse", dsn)`, or
+`p.WrapConnector(clickhouse.Connector(opts))`) needs nothing more. On the
+native API, `Query` is timed until its rows are closed or read to the end,
+`QueryRow` until its `Scan` (no row isn't a failure), `Select`, `Exec` and
+`AsyncInsert` until they answer, and a `PrepareBatch` batch, counted when its
+`Send` answers, for the time spent waiting on the server (preparing it, each
+`Flush` and the `Send`, not your code filling it in); an aborted one isn't
+counted. Every other method goes straight to your connection. A database/sql query is timed until the
 driver answers, a pgx query until its rows are closed. pgx through
 database/sql with both hooks on is counted once, by the wrapper.
 `(*sql.Conn).Raw` hands you the wrapper: `sitegoose.UnwrapConn(c)` is the
@@ -163,7 +175,97 @@ slog.SetDefault(slog.New(p.SlogHandler(slog.NewJSONHandler(os.Stderr, nil))))
 ```
 
 Outgoing requests become breadcrumbs through
-`&http.Client{Transport: p.Transport(nil)}`.
+`&http.Client{Transport: p.Transport(nil)}` (the same client times them, see
+"Outgoing calls").
+
+## Outgoing calls
+
+Health → Server speed → Calls shows how long each route waited on other
+services (a payment provider, an email API, your own microservices) by the
+host it called (`api.stripe.com`), with how many calls failed. Make your HTTP
+calls through the package's transport, with the request's context:
+
+```go
+client := &http.Client{Transport: p.Transport(nil)} // nil: http.DefaultTransport, used as it is
+req, _ := http.NewRequestWithContext(r.Context(), "POST", "https://api.stripe.com/v1/charges", body)
+res, err := client.Do(req)
+```
+
+- **Only the host is sent.** A call's path, query string, headers and body
+  never leave your server: paths carry IDs and keys. The host is lower case,
+  with its port only when it isn't the scheme's own.
+- A call is timed from being sent to its response's headers arriving (a body
+  read afterwards isn't counted). A call that got no answer (refused, timed
+  out, reset) or a 5xx is a failed one; a 4xx is the other side's answer, not
+  a failure. A call your code cancels (`context.Canceled`) isn't counted; one
+  that ran out of time (a context deadline, `http.Client.Timeout`) failed.
+- `p.Transport(base)` wraps a transport of your own the same way; nothing
+  global is changed, so a client not built on it isn't seen.
+- Calls are filed as queries are: under the request, the `p.Job`, or
+  `JOB (background)`. The package's own calls to us are left out.
+- They ride on Server speed's switch;
+  `Performance: PerformanceOptions{DisableCalls: true}` leaves them out (the
+  transport then only adds breadcrumbs).
+
+## Job queues
+
+Health → Server speed → Jobs shows each queue's backlog once a minute: jobs
+waiting, running, delayed and failed, how long the oldest has waited, and jobs
+finished — so a queue falling behind shows before the emails go out an hour
+late. asynq:
+
+```go
+// go get github.com/sitegoose/sitegoose-go/asynq (Go 1.22, as asynq needs)
+redis := asynq.RedisClientOpt{Addr: "127.0.0.1:6379"}
+inspector := asynq.NewInspector(redis)
+stop := sitegooseasynq.Watch(p, inspector, redis) // redis only names where the queues live
+defer stop()
+```
+
+- It reads `inspector.Queues()` and `GetQueueInfo` for each: pending is
+  waiting, active running, scheduled, retry and aggregating delayed, archived
+  failed, and the queue's latency how long the oldest pending task has waited.
+- Finished is asynq's own count for the whole queue: tasks that succeeded plus
+  tasks newly archived (failed for good), so watching one queue in every
+  process is fine and the dashboard takes it once. It comes from asynq's
+  running totals, so midnight changes nothing; workers older than asynq 0.24
+  keep only the day's counts, and then the minute across midnight UTC sends
+  no finished count. asynq doesn't count tasks added, so that line stays
+  empty.
+- The Redis is named by host, port and database (`127.0.0.1:6379/0`), never
+  its user name or password.
+- A reading that fails, or takes over ten seconds, is a gap, not a zero.
+  Readings run in the background, never in a request, each broker's at once.
+- Another queue library: `p.WatchQueues("other", "host:port/db", read)`, where
+  `read(ctx)` gives a `[]sitegoose.QueueReading` (a nil field is one it can't
+  say, sent as empty, never 0).
+- Time each job too with `p.Job(ctx, "send-email", fn)` inside your handler.
+- They ride on Server speed's switch;
+  `Performance: PerformanceOptions{DisableQueues: true}` leaves them out.
+
+## Limits
+
+With the `resources` module on, each minute's row also says how close the app
+is to a wall, which on a container is rarely the machine. Nothing to set up;
+a figure this machine can't give is left out, never sent as 0. On Linux:
+
+- **The container's caps**: its memory limit and the working set counted
+  against it (cgroup v2 or v1, page cache left out as Docker shows it), its
+  CPU limit, how often that limit held it back, and processes killed for
+  memory in it. No cap (a bare machine, a service with no `MemoryMax`) sends
+  none. The app's own kill can't be seen from inside it; the process's
+  uptime starting again is how it shows.
+- **Waiting time** (`/proc/pressure`), connections refused because the app
+  didn't accept them in time (`ListenOverflows`), how full the
+  connection-tracking table is, and the process's open files against its
+  limit.
+- **Go's own figures**: the memory the runtime holds against its memory limit
+  (`GOMEMLIMIT` or `debug.SetMemoryLimit`; with none set, which is Go's
+  default, nothing is sent), the time garbage collection stopped the program,
+  how long this process has run, and, with `p.Middleware` (or an adapter)
+  installed, the most requests in progress at once (a WebSocket stops
+  counting once its connection is taken over). Processes under one
+  server name are told apart by a random key each picks at start.
 
 ## Background work
 

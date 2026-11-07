@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -110,6 +111,59 @@ func TestStaticFilesDontCountTowardsTheRate(t *testing.T) {
 	f.Check(CheckInput{IP: "8.8.8.8", Target: "/a"})
 	if d := f.Check(CheckInput{IP: "8.8.8.8", Target: "/b.php"}); d.Rule != "rate" {
 		t.Fatal(d)
+	}
+}
+
+// Tricks that would make a page read as a static file, so a flood of them
+// skips the rate and the page limits, and real assets: the cases every
+// package shares (sdk/protocols/static-cases.json, firewall.md, `rate`).
+func TestStaticFileTricksCount(t *testing.T) {
+	var shared struct {
+		Cases []struct {
+			Path   string   `json:"path"`
+			Method string   `json:"method"`
+			Static bool     `json:"static"`
+			Only   []string `json:"only"`
+		} `json:"cases"`
+	}
+	readShared(t, "static-cases.json", &shared)
+	type request struct{ method, target string }
+	var notStaticTargets, staticTargets []request
+	for _, c := range shared.Cases {
+		if c.Only != nil && !slices.Contains(c.Only, "go") {
+			continue
+		}
+		if c.Method == "" {
+			c.Method = "GET"
+		}
+		if staticAsset(c.Path, c.Method) != c.Static {
+			t.Errorf("%s %.60q: static %v, want %v", c.Method, c.Path, !c.Static, c.Static)
+		}
+		if c.Static {
+			staticTargets = append(staticTargets, request{c.Method, c.Path})
+		} else {
+			notStaticTargets = append(notStaticTargets, request{c.Method, c.Path})
+		}
+	}
+	rate := testFirewall(t, "s", map[string]any{"v": 1, "enabled": true, "mode": "block", "rate": map[string]any{"limit": 1}}, FirewallOptions{})
+	limits := testFirewall(t, "s", map[string]any{"v": 1, "enabled": true, "mode": "block", "limits": map[string]any{"rules": []any{
+		map[string]any{"id": "all", "action": "block", "limit": 1, "window": 60, "path": map[string]any{"prefix": []any{"/"}}},
+	}}}, FirewallOptions{})
+	for i, r := range append(append([]request{}, notStaticTargets...), staticTargets...) {
+		target := r.target
+		ip := "203.0.113." + strconv.Itoa(i+1)
+		wantRate, wantLimit := "rate", "limit:all"
+		if i >= len(notStaticTargets) {
+			wantRate, wantLimit = "", ""
+		}
+		rate.Check(CheckInput{IP: ip, Method: r.method, Target: target})
+		if d := rate.Check(CheckInput{IP: ip, Method: r.method, Target: target}); d.Rule != wantRate {
+			t.Errorf("rate, %.60q: %q", target, d.Rule)
+		}
+		limits.Check(CheckInput{IP: ip, Method: r.method, Target: target})
+		if d := limits.Check(CheckInput{IP: ip, Method: r.method, Target: target}); d.Rule != wantLimit {
+			t.Errorf("page limit, %.60q: %q", target, d.Rule)
+		}
 	}
 }
 

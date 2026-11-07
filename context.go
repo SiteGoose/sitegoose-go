@@ -37,6 +37,7 @@ type reqState struct {
 	job      bool
 	request  *http.Request // the request as the router sees it: ServeMux sets its Pattern
 	mux      *http.ServeMux
+	late     *lateHit // a static file the firewall counts after the response
 
 	mu       sync.Mutex
 	route    string
@@ -48,6 +49,7 @@ type reqState struct {
 	hijacked bool // the connection was taken over (a WebSocket)
 
 	queries requestQueries // the database queries it ran
+	calls   requestQueries // the outgoing HTTP calls it made
 }
 
 type stateKey struct{}
@@ -126,6 +128,26 @@ func (st *reqState) routeName() string {
 				return patternRoute(pattern)
 			}
 		}
+	}
+	return ""
+}
+
+// routePattern is the route the router sent the request to, as it wrote
+// it: one given with SetRoute (the chi, gin and echo adapters), else
+// ServeMux's pattern ("GET /search/{q}"). "" when none matched.
+func (st *reqState) routePattern() string {
+	st.mu.Lock()
+	route := st.route
+	st.mu.Unlock()
+	if route != "" || st.request == nil {
+		return route
+	}
+	if pattern := requestPattern(st.request); pattern != "" {
+		return pattern
+	}
+	if st.mux != nil {
+		_, pattern := st.mux.Handler(st.request)
+		return pattern
 	}
 	return ""
 }

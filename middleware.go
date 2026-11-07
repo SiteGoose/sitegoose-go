@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -59,11 +60,15 @@ func (p *Platform) Middleware(next http.Handler) http.Handler {
 type Exchange struct {
 	p       *Platform
 	r       *http.Request
+	w       http.ResponseWriter // its Content-Type, read once answered
 	st      *reqState
 	started time.Time
 	ua      string
 	nested  bool
 	done    bool
+	// inFlight: counted as in progress for the resources module's peak,
+	// until it finishes or its connection is taken over.
+	inFlight atomic.Bool
 }
 
 // Begin runs what comes before the handler. nil means the request has been
@@ -75,7 +80,7 @@ func (p *Platform) Begin(w http.ResponseWriter, r *http.Request) (ex *Exchange) 
 		return &Exchange{p: p, r: r, st: st, nested: true}
 	}
 	started := time.Now()
-	answer, ip, remember := p.before(r)
+	answer, ip, remember, late := p.before(r)
 	switch {
 	case answer != nil && answer.custom != nil:
 		answer.custom(w, r)
@@ -90,10 +95,22 @@ func (p *Platform) Begin(w http.ResponseWriter, r *http.Request) (ex *Exchange) 
 	case remember != "":
 		w.Header().Add("Set-Cookie", remember)
 	}
-	st := &reqState{platform: p, method: r.Method, path: r.URL.Path, session: SessionID(r), ip: ip}
+	st := &reqState{platform: p, method: r.Method, path: r.URL.Path, session: SessionID(r), ip: ip, late: late}
 	r2 := r.WithContext(withState(r.Context(), st))
 	st.request = r2
-	return &Exchange{p: p, r: r2, st: st, started: started, ua: r.UserAgent()}
+	ex = &Exchange{p: p, r: r2, w: w, st: st, started: started, ua: r.UserAgent()}
+	if p.perf != nil {
+		p.perf.started()
+		ex.inFlight.Store(true)
+	}
+	return ex
+}
+
+// landed ends the request's time in flight, once.
+func (e *Exchange) landed() {
+	if e.inFlight.CompareAndSwap(true, false) {
+		e.p.perf.ended()
+	}
 }
 
 type earlyAnswer struct {
@@ -123,11 +140,13 @@ func writeAnswer(w http.ResponseWriter, a *earlyAnswer) {
 }
 
 // before decides on a request before the handler; a failure of ours lets it through.
-func (p *Platform) before(r *http.Request) (answer *earlyAnswer, ip, remember string) {
+// late: a static-looking request let through, counted after the response
+// if the router sent it to a page (Exchange.countStatic).
+func (p *Platform) before(r *http.Request) (answer *earlyAnswer, ip, remember string, late *lateHit) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			p.core.log("core", "request check failed, request passed: %v", rec)
-			answer, remember = nil, ""
+			answer, remember, late = nil, "", nil
 		}
 	}()
 	ip = p.ClientIP(r)
@@ -142,17 +161,19 @@ func (p *Platform) before(r *http.Request) (answer *earlyAnswer, ip, remember st
 		if kind, rest := p.proxy.match(r.URL.Path); kind != "" {
 			if checked {
 				if d := f.checkAddress(in); d.Action == "block" {
-					return p.blockedAnswer(r, d, ip), ip, ""
+					return p.blockedAnswer(r, d, ip), ip, "", nil
 				}
 			}
 			a := p.proxy.handle(kind, rest, r, ip)
-			return &earlyAnswer{status: a.status, header: a.header, body: a.body}, ip, ""
+			return &earlyAnswer{status: a.status, header: a.header, body: a.body}, ip, "", nil
 		}
 	}
 	if checked {
-		if d := f.Check(in); d.Action == "block" {
-			return p.blockedAnswer(r, d, ip), ip, ""
+		d := f.Check(in)
+		if d.Action == "block" {
+			return p.blockedAnswer(r, d, ip), ip, "", nil
 		}
+		late = d.late
 	}
 	if p.maint != nil {
 		decision := p.maint.decide(r, ip)
@@ -161,15 +182,15 @@ func (p *Platform) before(r *http.Request) (answer *earlyAnswer, ip, remember st
 			h.Set("Content-Type", "text/html; charset=utf-8")
 			h.Set("Retry-After", "600")
 			h.Set("Cache-Control", "no-store")
-			return &earlyAnswer{status: http.StatusServiceUnavailable, header: h, body: maintenancePage(p.maint.message())}, ip, ""
+			return &earlyAnswer{status: http.StatusServiceUnavailable, header: h, body: maintenancePage(p.maint.message())}, ip, "", nil
 		}
 		remember = decision.setCookie
 	}
-	return nil, ip, remember
+	return nil, ip, remember, late
 }
 
 // blockedAnswer: the check page for rule "challenge", else 403 (429 with
-// Retry-After for the rate limit), or nothing when OnBlock answered itself.
+// Retry-After for the rate limit and a page limit), or nothing when OnBlock answered itself.
 func (p *Platform) blockedAnswer(r *http.Request, d Decision, ip string) *earlyAnswer {
 	f := p.firewall
 	if d.Rule == "challenge" {
@@ -191,8 +212,17 @@ func (p *Platform) blockedAnswer(r *http.Request, d Decision, ip string) *earlyA
 	h.Set("Content-Type", "text/plain; charset=utf-8")
 	h.Set("Cache-Control", "no-store")
 	if d.Status == http.StatusTooManyRequests {
-		h.Set("Retry-After", f.retryAfter())
-		return &earlyAnswer{status: d.Status, header: h, body: []byte("Too Many Requests"), crawler: true}
+		// A page limit waits out its own window, not the site-wide one.
+		retry := f.retryAfter()
+		if d.RetryAfter > 0 {
+			retry = strconv.FormatInt(d.RetryAfter, 10)
+		}
+		h.Set("Retry-After", retry)
+		body := "Too Many Requests"
+		if strings.HasPrefix(d.Rule, "limit:") {
+			body = limitBody
+		}
+		return &earlyAnswer{status: d.Status, header: h, body: []byte(body), crawler: true}
 	}
 	return &earlyAnswer{status: http.StatusForbidden, header: h, body: []byte("Forbidden"), crawler: true}
 }
@@ -287,6 +317,8 @@ func (e *Exchange) Hijacked() {
 		e.st.mu.Lock()
 		e.st.hijacked = true
 		e.st.mu.Unlock()
+		// A WebSocket open for an hour isn't a request in progress.
+		e.landed()
 	}
 }
 
@@ -341,11 +373,13 @@ func (e *Exchange) finish(status int, size int64, rw *responseWriter) {
 		return
 	}
 	e.done = true
+	e.landed()
 	defer func() {
 		if r := recover(); r != nil {
 			e.p.core.log("core", "could not finish a request: %v", r)
 		}
 	}()
+	e.countStatic(status)
 	e.st.mu.Lock()
 	aborted, hijacked := e.st.aborted, e.st.hijacked
 	e.st.mu.Unlock()
@@ -379,6 +413,56 @@ func (e *Exchange) finish(status int, size int64, rw *responseWriter) {
 	}
 	err := &statusError{status: status, text: text, method: e.st.method, route: firstNonEmpty(e.st.routeName(), normalizeRoute(e.st.path))}
 	e.p.errors.captureStatus(e.r.Context(), err, pcs)
+}
+
+// countStatic: a static-looking request the firewall only compared with
+// the counts (firewall.md, `rate`) counts toward the rate and the page
+// limits after all when it answered 400 or more, or the router sent it to a
+// route that isn't a file's: ServeMux's pattern (r.Pattern, Go 1.23+, which
+// ServeMux sets on the request this package handed it; before 1.23 the
+// wrapped ServeMux is asked), or the one an adapter or SetRoute gave (gin's
+// FullPath, chi's RoutePattern, echo's Path). A file server's answer (its
+// Content-Type is a file's) is left alone. A shared counter is called off
+// the request (at most lateSlotsMax at once; past them, on it), so the
+// answer doesn't wait on it.
+func (e *Exchange) countStatic(status int) {
+	late := e.st.late
+	f := e.p.firewall
+	if late == nil || f == nil {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			e.p.core.log("firewall", "could not count a static file: %v", r)
+		}
+	}()
+	contentType := ""
+	if e.w != nil {
+		contentType = e.w.Header().Get("Content-Type")
+	}
+	routed := routedToPage(e.st.routePattern(), contentType)
+	// A file the visitor's page asked for, most of them: nothing to count.
+	if !countsLate(status, routed) {
+		return
+	}
+	if f.counter == nil {
+		f.countStatic(late, status, routed)
+		return
+	}
+	select {
+	case f.lateSlots <- struct{}{}:
+		go func() {
+			defer func() {
+				recover()
+				<-f.lateSlots
+			}()
+			f.countStatic(late, status, routed)
+		}()
+	default:
+		// As many counting already as there may be: this one waits on the
+		// counter here, as a page's request does, rather than pile up.
+		f.countStatic(late, status, routed)
+	}
 }
 
 type statusError struct {
@@ -525,6 +609,7 @@ func (w *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	conn, rw, err := http.NewResponseController(w.ResponseWriter).Hijack()
 	if err == nil {
 		w.hijacked = true
+		w.ex.landed()
 	}
 	return conn, rw, err
 }

@@ -39,6 +39,16 @@ func TestQueryCases(t *testing.T) {
 	}
 }
 
+// The database's name is lower-cased as JavaScript's toLowerCase does: the
+// Kelvin sign is a k, and İ is two characters, not an i.
+func TestDatabaseOfLowersAsTheReference(t *testing.T) {
+	for in, want := range map[string]string{"SQLite": "sqlite", "CLIC\u212aHOUSE": "clickhouse", "SQL\u0130TE": "other", "nonsense": "other"} {
+		if got := databaseOf(in); got != want {
+			t.Errorf("%q: got %q, want %q", in, got, want)
+		}
+	}
+}
+
 // ---- A database/sql driver of our own ----
 
 var fakeSeen struct {

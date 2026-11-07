@@ -11,6 +11,10 @@ package sitegoose
 // database and statement goes to POST /events/server-queries, as Server
 // speed sends its own. On with the performance module, unless
 // PerformanceOptions.DisableQueries.
+//
+// Outgoing HTTP calls (sdk/protocols/calls.md, calls.go) are filed the same
+// way by this same code, keyed by call method and host in place of database
+// and statement, and go to POST /events/server-calls.
 
 import (
 	"context"
@@ -69,9 +73,27 @@ func (s *queryStat) merge(o *queryStat) {
 	}
 }
 
-type queryStatKey struct{ db, statement string }
+// queryStatKey is a query's database and statement, or a call's method and
+// host: the second is the one a capped key folds into "(other)".
+type queryStatKey struct{ a, b string }
 
-// requestQueries are the queries one request (or job) ran, until it finishes.
+// timingKind is what a queries value files: database queries or outgoing
+// calls, their endpoint and the names of their two key fields.
+type timingKind struct {
+	path   string
+	fields [2]string
+	// of is the request's own map of this kind.
+	of func(st *reqState) *requestQueries
+}
+
+var (
+	queriesKind = timingKind{path: "/events/server-queries", fields: [2]string{"db", "statement"},
+		of: func(st *reqState) *requestQueries { return &st.queries }}
+	callsKind = timingKind{path: "/events/server-calls", fields: [2]string{"call_method", "host"},
+		of: func(st *reqState) *requestQueries { return &st.calls }}
+)
+
+// requestQueries are the queries (or calls) one request (or job) ran, until it finishes.
 type requestQueries struct {
 	mu    sync.Mutex
 	stats map[queryStatKey]*queryStat
@@ -82,10 +104,11 @@ type requestQueries struct {
 	route  string
 }
 
-type queryRowKey struct{ method, route, db, statement string }
+type queryRowKey struct{ method, route, a, b string }
 
 type queries struct {
 	core       *core
+	kind       timingKind
 	serverName string
 	mu         sync.Mutex
 	rows       map[int64]map[queryRowKey]*queryStat // by minute
@@ -93,8 +116,8 @@ type queries struct {
 	now        func() time.Time
 }
 
-func newQueries(c *core, perf *performance) *queries {
-	q := &queries{core: c, serverName: perf.serverName, rows: map[int64]map[queryRowKey]*queryStat{}, now: time.Now}
+func newTimings(c *core, perf *performance, kind timingKind) *queries {
+	q := &queries{core: c, kind: kind, serverName: perf.serverName, rows: map[int64]map[queryRowKey]*queryStat{}, now: time.Now}
 	q.job = c.every(performanceFlush, func() time.Duration {
 		q.flush(context.Background(), false)
 		return performanceFlush
@@ -118,7 +141,8 @@ func timedOutside(ctx context.Context) bool {
 
 // RecordQuery counts one database query the app ran, for a database library
 // this package has no hook for: db is "postgresql", "mysql", "mariadb",
-// "sqlite", "mssql", "oracle" or "mongodb" (anything else is "other"), and
+// "sqlite", "mssql", "oracle", "clickhouse" or "mongodb" (anything else is
+// "other"), and
 // statement the query as run. Its values are taken out here, before it is
 // counted; bound parameters are never asked for. ctx is the one the query
 // was given: the request (or p.Job) it belongs to, else it counts as a
@@ -132,11 +156,7 @@ func (p *Platform) RecordQuery(ctx context.Context, db, statement string, d time
 			p.core.log("performance", "could not count a query: %v", r)
 		}
 	}()
-	p.queries.record(ctx, p, db, statement, float64(d)/float64(time.Millisecond), err != nil)
-}
-
-func (q *queries) record(ctx context.Context, p *Platform, db, statement string, ms float64, failed bool) {
-	if !q.core.isOn(ModulePerformance) {
+	if !p.core.isOn(ModulePerformance) {
 		return
 	}
 	db = databaseOf(db)
@@ -144,20 +164,29 @@ func (q *queries) record(ctx context.Context, p *Platform, db, statement string,
 	if statement == "" {
 		return
 	}
+	p.queries.record(ctx, p, db, statement, float64(d)/float64(time.Millisecond), err != nil)
+}
+
+// record files one query (a: database, b: statement) or call (a: call
+// method, b: host) under the request ctx belongs to.
+func (q *queries) record(ctx context.Context, p *Platform, a, b string, ms float64, failed bool) {
+	if !q.core.isOn(ModulePerformance) {
+		return
+	}
 	if ms < 0 {
 		ms = 0
 	}
 	method, route := "JOB", backgroundRoute
 	if st := stateFrom(ctx); st != nil && st.platform == p {
-		rq := &st.queries
+		rq := q.kind.of(st)
 		rq.mu.Lock()
 		if !rq.done {
-			key := queryStatKey{db, statement}
+			key := queryStatKey{a, b}
 			if rq.stats == nil {
 				rq.stats = map[queryStatKey]*queryStat{}
 			}
 			if _, ok := rq.stats[key]; !ok && len(rq.stats) >= maxRequestStatements {
-				key.statement = otherStatement
+				key.b = otherStatement
 			}
 			s := rq.stats[key]
 			if s == nil {
@@ -174,7 +203,7 @@ func (q *queries) record(ctx context.Context, p *Platform, db, statement string,
 	s := newQueryStat()
 	s.add(ms, failed)
 	q.mu.Lock()
-	q.addLocked(q.now().Unix()/60*60, queryRowKey{method, route, db, statement}, s)
+	q.addLocked(q.now().Unix()/60*60, queryRowKey{method, route, a, b}, s)
 	q.mu.Unlock()
 }
 
@@ -199,7 +228,7 @@ func (q *queries) addLocked(minute int64, key queryRowKey, s *queryStat) {
 		q.rows[minute] = rows
 	}
 	if _, ok := rows[key]; !ok && len(rows) >= maxMinuteStatements {
-		key.statement = otherStatement
+		key.b = otherStatement
 		if _, ok := rows[key]; !ok && len(rows) >= maxMinuteKeys {
 			return
 		}
@@ -212,11 +241,11 @@ func (q *queries) addLocked(minute int64, key queryRowKey, s *queryStat) {
 	row.merge(s)
 }
 
-// endQueries adds a finished request's (or job's) queries into the minute's
-// rows, under the method and route it was counted under: method "" works
-// them out as Server speed does.
+// endQueries adds a finished request's (or job's) queries and calls into
+// the minute's rows, under the method and route it was counted under:
+// method "" works them out as Server speed does.
 func (p *Platform) endQueries(st *reqState, method, route string, status int) {
-	if p == nil || p.queries == nil || st == nil {
+	if p == nil || st == nil || (p.queries == nil && p.calls == nil) {
 		return
 	}
 	defer func() {
@@ -227,7 +256,15 @@ func (p *Platform) endQueries(st *reqState, method, route string, status int) {
 	if method == "" {
 		method, route = perfName(st.method, st.routeName(), status, st.path)
 	}
-	rq := &st.queries
+	p.queries.end(st, method, route)
+	p.calls.end(st, method, route)
+}
+
+func (q *queries) end(st *reqState, method, route string) {
+	if q == nil {
+		return
+	}
+	rq := q.kind.of(st)
 	rq.mu.Lock()
 	stats := rq.stats
 	rq.stats, rq.done, rq.method, rq.route = nil, true, method, route
@@ -235,12 +272,11 @@ func (p *Platform) endQueries(st *reqState, method, route string, status int) {
 	if len(stats) == 0 {
 		return
 	}
-	q := p.queries
 	minute := q.now().Unix() / 60 * 60
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	for k, s := range stats {
-		q.addLocked(minute, queryRowKey{method, route, k.db, k.statement}, s)
+		q.addLocked(minute, queryRowKey{method, route, k.a, k.b}, s)
 	}
 }
 
@@ -256,22 +292,18 @@ func (q *queries) flush(ctx context.Context, everything bool) {
 		delete(q.rows, minute)
 		for k, v := range keys {
 			rows = append(rows, map[string]any{
-				"minute": isoMinute(time.Unix(minute, 0)), "method": k.method, "route": k.route, "db": k.db,
-				"statement": k.statement, "count": v.count, "errors": v.errors, "sum_ms": round1(v.sumMS),
+				"minute": isoMinute(time.Unix(minute, 0)), "method": k.method, "route": k.route, q.kind.fields[0]: k.a,
+				q.kind.fields[1]: k.b, "count": v.count, "errors": v.errors, "sum_ms": round1(v.sumMS),
 				"max_ms": round1(v.maxMS), "buckets": v.buckets,
 			})
 		}
 	}
 	q.mu.Unlock()
-	for i := 0; i < len(rows); i += maxRows {
-		end := i + maxRows
-		if end > len(rows) {
-			end = len(rows)
-		}
-		q.core.send(ctx, "performance", "/events/server-queries", http.MethodPost, map[string]any{
-			"site_id": q.core.siteID, "server_name": q.serverName, "runtime": runtimeName(), "rows": rows[i:end],
+	inChunks(rows, func(part []map[string]any) {
+		q.core.send(ctx, "performance", q.kind.path, http.MethodPost, map[string]any{
+			"site_id": q.core.siteID, "server_name": q.serverName, "runtime": runtimeName(), "rows": part,
 		}, authBearer, nil)
-	}
+	})
 }
 
 func (q *queries) close(ctx context.Context) {

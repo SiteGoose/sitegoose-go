@@ -98,6 +98,8 @@ type Platform struct {
 	analytics *analytics
 	perf      *performance
 	queries   *queries
+	calls     *queries
+	queueRead *queueWatch
 	crawlers  *crawlers
 	audit     *audit
 	maint     *maintenance
@@ -181,7 +183,13 @@ func (p *Platform) load(name string, o Options) (err error) {
 	case ModulePerformance:
 		p.perf = newPerformance(c, o.Performance)
 		if !o.Performance.DisableQueries {
-			p.queries = newQueries(c, p.perf)
+			p.queries = newTimings(c, p.perf, queriesKind)
+		}
+		if !o.Performance.DisableCalls {
+			p.calls = newTimings(c, p.perf, callsKind)
+		}
+		if !o.Performance.DisableQueues {
+			p.queueRead = newQueueWatch(c, p.perf)
 		}
 	case ModuleCrawlers:
 		p.crawlers = newCrawlers(c, o.Crawlers)
@@ -200,7 +208,7 @@ func (p *Platform) load(name string, o Options) (err error) {
 	case ModulePosture:
 		p.posture = newPosture(c, o.Posture)
 	case ModuleResources:
-		p.resources = newResources(c, o.Resources)
+		p.resources = newResourcesFor(c, o.Resources, p.perf)
 	}
 	return nil
 }
@@ -567,6 +575,18 @@ func (p *Platform) flushAll(ctx context.Context, closing bool) {
 				p.queries.flush(ctx, true)
 			}
 		})
+	}
+	if p.calls != nil {
+		run(func() {
+			if closing {
+				p.calls.close(ctx)
+			} else {
+				p.calls.flush(ctx, true)
+			}
+		})
+	}
+	if p.queueRead != nil && closing {
+		run(func() { p.queueRead.close(ctx) })
 	}
 	if p.crawlers != nil {
 		run(func() {

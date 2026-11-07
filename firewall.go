@@ -42,10 +42,26 @@ type Decision struct {
 	// Action is "allow", "block" or "monitor" (matched, but only reported).
 	Action string
 	// Rule is empty when allowed: "deny", "ban", "list", "shared", "probe",
-	// "rate", "challenge" or "request:<id>".
+	// "rate", "challenge", "request:<id>" or "limit:<id>" (a page limit).
 	Rule string
-	// Status: 200 allowed, 403, 429 for the rate limit, 503 for the browser check.
+	// Status: 200 allowed, 403, 429 for the rate limit and a page limit, 503
+	// for the browser check.
 	Status int
+	// RetryAfter is the seconds a 429 asks the visitor to wait: the window
+	// of the rate limit or of the page limit that decided. 0 otherwise.
+	RetryAfter int64
+
+	// late: a static file let through, for countStatic after the response.
+	late *lateHit
+}
+
+// lateHit is a static-looking request Check only compared with the counts
+// (firewall.md, `rate`): what countStatic adds after the response when the
+// router sent it to a page or it answered an error.
+type lateHit struct {
+	key  ipKey
+	rate bool
+	req  *preparedRequest // nil: no page limit to count
 }
 
 // CheckInput is one request as the firewall checks it.
@@ -104,6 +120,7 @@ type firewallRules struct {
 	login     *loginRule
 	probes    *probeRule
 	requests  []*requestRule
+	limits    *pageLimits
 	challenge *challengeRule
 }
 
@@ -144,9 +161,22 @@ type Firewall struct {
 	queue  map[string]*firewallEvent
 	bans   map[ipKey]time.Time
 	logins map[ipKey]*loginCount
+	// Page limits: "id window who" -> its count. Limits with each: "path"
+	// ("id window who path") keep theirs in pathCounts, a table of their own:
+	// one entry per address and page fills a table fast, and it mustn't
+	// crowd out the login limit's counts.
+	limitCounts, pathCounts map[string]*limitCount
 	// When each table was last swept of what has run out: at most once a
 	// second, so a flood of new addresses can't make every request sweep.
-	countsSwept, bansSwept, loginsSwept time.Time
+	countsSwept, bansSwept, loginsSwept, limitsSwept, pathsSwept time.Time
+	// With a shared counter: the counts this process saw go over (their
+	// key, window and all), so a static file asked for after them can be
+	// turned away without adding to them (a counter can only add).
+	overNoted map[string]bool
+	// With a shared counter: the static files being counted off their
+	// requests at once (countStatic). Past it, one is counted on its own
+	// request, as a page's count is, so a flood can't pile up goroutines.
+	lateSlots chan struct{}
 
 	syncJob  *periodic
 	flushJob *periodic
@@ -164,12 +194,17 @@ func newFirewall(c *core, o FirewallOptions, trust string, clientFn func(*http.R
 		onBlock:   o.OnBlock,
 		// Passes are signed with the site secret, so any of the site's
 		// servers accepts one another handed out.
-		passKey: passKey(c.secret),
-		counts:  map[ipKey]*[2]int64{},
-		queue:   map[string]*firewallEvent{},
-		bans:    map[ipKey]time.Time{},
-		logins:  map[ipKey]*loginCount{},
-		now:     time.Now,
+		passKey:   passKey(c.secret),
+		counts:    map[ipKey]*[2]int64{},
+		overNoted: map[string]bool{},
+		lateSlots: make(chan struct{}, lateSlotsMax),
+		queue:     map[string]*firewallEvent{},
+		bans:      map[ipKey]time.Time{},
+		logins:    map[ipKey]*loginCount{},
+		now:       time.Now,
+
+		limitCounts: map[string]*limitCount{},
+		pathCounts:  map[string]*limitCount{},
 	}
 	if o.Mode == "monitor" || o.Mode == "block" {
 		f.mode = o.Mode
@@ -248,6 +283,8 @@ func compileFirewall(data map[string]any) (*firewallRules, error) {
 		shared:   newIPSet(stringList(data["shared"])),
 		banned:   newIPSet(stringList(data["banned"])),
 		requests: compileRequestRules(data["requests"]),
+		// Page limits: caps on one kind of request (absent in older rules).
+		limits: compilePageLimits(data["limits"]),
 	}
 	if data["mode"] == "block" {
 		r.mode = "block"
@@ -391,19 +428,32 @@ func (f *Firewall) room(size int, swept *time.Time, sweep func(now time.Time)) b
 	return false
 }
 
-func (f *Firewall) overRate(key ipKey, rate *rateRule) bool {
+// overRate counts the request toward the rate. peek: only compared with
+// the count so far, nothing added (a static file).
+func (f *Firewall) overRate(key ipKey, rate *rateRule, peek bool) bool {
 	key = localKey(key)
 	window := f.now().Unix() / rate.window
 	if f.counter != nil {
-		hits, err := f.counter("afw:"+f.core.siteID+":"+localName(key)+":"+strconv.FormatInt(window, 10), time.Duration(rate.window*2)*time.Second)
-		if err == nil {
-			return hits > rate.limit
+		name := "afw:" + f.core.siteID + ":" + localName(key) + ":" + strconv.FormatInt(window, 10)
+		if peek {
+			// Seen over, else the count kept here while the counter failed.
+			if f.noted(name) {
+				return true
+			}
+		} else {
+			hits, err := f.counter(name, time.Duration(rate.window*2)*time.Second)
+			if err == nil {
+				return f.noteOver(name, hits > rate.limit)
+			}
+			f.core.log("firewall", "shared counter failed, counted here: %v", err)
 		}
-		f.core.log("firewall", "shared counter failed, counted here: %v", err)
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	entry := f.counts[key]
+	if peek {
+		return entry != nil && entry[0] == window && entry[1] > rate.limit
+	}
 	if entry == nil || entry[0] != window {
 		if entry == nil && !f.room(len(f.counts), &f.countsSwept, func(time.Time) {
 			for k, e := range f.counts {
@@ -419,6 +469,32 @@ func (f *Firewall) overRate(key ipKey, rate *rateRule) bool {
 	}
 	entry[1]++
 	return entry[1] > rate.limit
+}
+
+// noted: whether this process saw the shared count name go over.
+func (f *Firewall) noted(name string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.overNoted[name]
+}
+
+// noteOver remembers a shared count seen over, under its key (window and
+// all, so an old one never matches again), for a static file's peek.
+func (f *Firewall) noteOver(name string, over bool) bool {
+	if over {
+		f.mu.Lock()
+		if !f.overNoted[name] {
+			if len(f.overNoted) >= counterMax {
+				for k := range f.overNoted {
+					delete(f.overNoted, k)
+					break
+				}
+			}
+			f.overNoted[name] = true
+		}
+		f.mu.Unlock()
+	}
+	return over
 }
 
 func (f *Firewall) bannedHere(key ipKey) bool {
@@ -544,15 +620,81 @@ func (f *Firewall) flush(ctx context.Context) {
 }
 
 // staticFile: files a page load asks for by the dozen, not counted against
-// the rate (the agent's nginx limit leaves the same extensions out), so a
-// page with 40 images, scripts and fonts is one hit, not 41; and /static/,
-// where a Go app's http.FileServer usually sits. Read from the path the
-// router sees, so "/admin;x.css" isn't one.
-var staticFile = regexp.MustCompile(`(?i)\.(?:css|js|mjs|map|png|jpe?g|gif|webp|avif|svg|ico|bmp|woff2?|ttf|otf|eot|mp4|webm|ogg|mp3|wav|pdf|wasm)$`)
+// the rate or the page limits (the agent's nginx limit leaves the same
+// extensions out), so a page with 40 images, scripts and fonts is one hit,
+// not 41; and the asset folders, /static/ where a Go app's http.FileServer
+// usually sits (firewall.md, `rate`). The extension must follow a name in
+// the last segment, not start it: "/login/.css" is no file.
+var staticFile = regexp.MustCompile(`/[^/.][^/]*\.(?:css|js|mjs|map|png|jpe?g|gif|webp|avif|svg|ico|bmp|woff2?|ttf|otf|eot|mp4|webm|ogg|mp3|wav|pdf|wasm)$`)
 
-func staticAsset(target string) bool {
-	clean := normalizeTarget(target)
-	return strings.HasPrefix(clean, "/static/") || staticFile.MatchString(clean)
+var staticPrefixes = []string{"/static/", "/_next/static/", "/assets/"}
+
+// unsure, in a path decoded once: a "%xx" still there (double encoding,
+// which a router that decodes again reads differently), a ";" (a path
+// parameter to some servers and proxies, part of the name to others), a
+// "\" (a "/" to some), a "?" or "#" that was encoded, or a control character. encodedSlash, in the path as sent: "%2F", a "/" to
+// some routers and part of a segment to others.
+var (
+	unsure       = regexp.MustCompile(`%[0-9a-fA-F]{2}|[;\\?#\x00-\x1f\x7f]`)
+	encodedSlash = regexp.MustCompile(`(?i)%2f`)
+)
+
+// staticAsset reads the path as r.URL.Path has it (decoded once, lower case,
+// "//" as "/"), and only a path every router reads the same way can be a
+// file: one with a "." or ".." segment, a ";", a "\", an encoded "/" or a
+// "%xx" left after decoding is a page, so "/static/../login",
+// "/static%2F..%2Flogin", "/login;x.css" and "/login%3Bx.css" all count. A
+// browser asks for its files with none of those. Nor is a path past the
+// rules' 2,000 characters a file: cut there, "/search/xxx…x.css/more" would
+// end in .css and flood a catch-all route past the limits. Only GET and HEAD
+// fetch a file (no method given is read as GET): a form posts to a page, and
+// some routers read /login.css as /login.
+func staticAsset(target, method string) bool {
+	if method != "" && method != http.MethodGet && method != http.MethodHead {
+		return false
+	}
+	if loc := queryOrFragment.FindStringIndex(target); loc != nil {
+		target = target[:loc[0]]
+	}
+	if len(target) > maxRuleText || !strings.HasPrefix(target, "/") || encodedSlash.MatchString(target) {
+		return false
+	}
+	decoded := decodeOnce(target)
+	if unsure.MatchString(decoded) {
+		return false
+	}
+	// A-Z only, as every package: strings.ToLower reads "İ" as "i".
+	segments := strings.Split(asciiLower(decoded), "/")
+	parts := make([]string, 0, len(segments))
+	for _, seg := range segments {
+		if seg == "." || seg == ".." {
+			return false
+		}
+		if seg != "" {
+			parts = append(parts, seg)
+		}
+	}
+	path := "/" + strings.Join(parts, "/")
+	if len(parts) > 0 && segments[len(segments)-1] == "" {
+		path += "/" // "/app.css/" isn't a file
+	}
+	for _, prefix := range staticPrefixes {
+		if strings.HasPrefix(path, prefix) {
+			return true
+		}
+	}
+	return staticFile.MatchString(path)
+}
+
+// asciiLower: A-Z as a-z, nothing else.
+func asciiLower(text string) string {
+	out := []byte(text)
+	for i, c := range out {
+		if c >= 'A' && c <= 'Z' {
+			out[i] = c + 32
+		}
+	}
+	return string(out)
 }
 
 // isProbe: the path (no query, lower-cased, "//" as "/") is a probe, as
@@ -616,8 +758,12 @@ func (f *Firewall) check(in CheckInput, now time.Time) Decision {
 			f.banHere(key, rules.probes.ban)
 		}
 	}
-	if rule == "" {
-		if matched := matchRequest(rules.requests, in.Method, in.Target, in.UserAgent); matched != nil {
+	var req *preparedRequest
+	if rule == "" && (len(rules.requests) > 0 || rules.limits != nil) {
+		req = prepareRequest(in.Method, in.Target, in.UserAgent)
+	}
+	if rule == "" && len(rules.requests) > 0 {
+		if matched := matchPrepared(rules.requests, req); matched != nil {
 			rule = "request:" + matched.id
 			// A rule the dashboard only watches passes even in block mode;
 			// one that blocks also bans the address here, as a flood does.
@@ -629,14 +775,6 @@ func (f *Firewall) check(in CheckInput, now time.Time) Decision {
 			}
 		}
 	}
-	if rule == "" && rules.rate != nil && !rules.goodbots.has(key) && !staticAsset(in.Target) && f.overRate(key, rules.rate) {
-		rule = "rate"
-		// Banned here straight away in block mode, as a probe is; the report
-		// bans it on the other servers.
-		if action == "block" {
-			f.banHere(key, rules.ban)
-		}
-	}
 	event := func(name, act string) firewallEvent {
 		path := in.Target
 		if i := strings.IndexByte(path, '?'); i >= 0 {
@@ -645,26 +783,138 @@ func (f *Firewall) check(in CheckInput, now time.Time) Decision {
 		return firewallEvent{IP: in.IP, Rule: name, Action: act, Method: truncate(in.Method, 10),
 			Path: truncate(path, 300), UserAgent: truncate(in.UserAgent, 300)}
 	}
+	// A static file isn't counted toward the page limits or the rate, only
+	// compared with the counts so far: an address already over them is
+	// turned away for its files too. It counts after the response when the
+	// router sent it to a page after all ("/search/{q}" took
+	// "/search/x.css") or it answered an error (countStatic).
+	static := staticAsset(in.Target, in.Method)
+	lateRate, lateLimits := false, false
+	// Page limits (step 6). Never banned: a shopper who refreshes checkout
+	// too often is a customer, and the cap lifts when the window ends.
+	var watched *pageLimit
+	retryAfter := int64(0)
+	if rule == "" && rules.limits != nil && !rules.goodbots.has(key) && !rules.limits.exempt.has(key) {
+		lateLimits = static
+		for _, limit := range f.overLimits(key, rules.limits.rules, req, static) {
+			if action == "block" && limit.action == "block" {
+				rule, retryAfter = "limit:"+limit.id, limit.window
+				break
+			}
+			// Only watched: reported, and the check goes on to the rate,
+			// so watching the login page doesn't let a flood through it
+			// untouched.
+			if watched == nil {
+				watched = limit
+			}
+		}
+		if rule != "" {
+			watched = nil
+		}
+	}
+	if rule == "" && rules.rate != nil && !rules.goodbots.has(key) {
+		lateRate = static
+	}
+	if rule == "" && rules.rate != nil && !rules.goodbots.has(key) && f.overRate(key, rules.rate, static) {
+		rule, retryAfter = "rate", rules.rate.window
+		// Banned here straight away in block mode, as a probe is; the report
+		// bans it on the other servers.
+		if action == "block" {
+			f.banHere(key, rules.ban)
+		}
+	}
+	if watched != nil {
+		if rule == "" {
+			rule, action, retryAfter = "limit:"+watched.id, "monitor", watched.window
+		} else {
+			// The rate decides; the watched limit is reported as well.
+			f.report(event("limit:"+watched.id, "monitor"))
+		}
+	}
 	// Not a mode matter: the collector only sends `challenge` when the site
 	// is to be checked, and a match only watched (monitor) gets it too
-	// (firewall.md, step 7).
+	// (firewall.md, step 8).
 	if (rule == "" || action != "block") && f.needsCheck(rules, key, in, now) {
 		if rule != "" {
 			f.report(event(rule, action))
 		}
-		rule, action = "challenge", "block"
+		rule, action, retryAfter = "challenge", "block", 0
+	}
+	// What countStatic needs after the response of a static file that goes on to the app.
+	var late *lateHit
+	if (lateRate || lateLimits) && (rule == "" || action != "block") {
+		late = &lateHit{key: key, rate: lateRate}
+		if lateLimits {
+			late.req = req
+		}
 	}
 	if rule == "" {
+		allow.late = late
 		return allow
 	}
 	f.report(event(rule, action))
 	status := http.StatusForbidden
-	if rule == "rate" {
+	if retryAfter > 0 {
 		status = http.StatusTooManyRequests
 	} else if rule == "challenge" {
 		status = http.StatusServiceUnavailable
 	}
-	return Decision{Action: action, Rule: rule, Status: status}
+	return Decision{Action: action, Rule: rule, Status: status, RetryAfter: retryAfter, late: late}
+}
+
+// countStatic: after the response to a static file Check let through (its
+// decision's late hit), counted toward the rate and the page limits it
+// skipped when it answered 400 or more (a flood of made-up file names) or
+// the router sent it to a route that isn't a file's (routed), unless it
+// answered 304 (a browser checking a file it keeps). In memory, or one
+// call to the shared counter, after the handler has written its answer.
+func (f *Firewall) countStatic(late *lateHit, status int, routed bool) {
+	if f == nil || late == nil || !countsLate(status, routed) {
+		return
+	}
+	rules := f.rules.Load()
+	if rules == nil {
+		return
+	}
+	if late.rate && rules.rate != nil {
+		f.overRate(late.key, rules.rate, false)
+	}
+	if late.req != nil && rules.limits != nil {
+		f.overLimits(late.key, rules.limits.rules, late.req, false)
+	}
+}
+
+// lateSlotsMax: the static files counted in goroutines at once with a
+// shared counter.
+const lateSlotsMax = 64
+
+// countsLate: whether a static file Check let through counts after its
+// response: it answered 400 or more, or a route that isn't a file's took it
+// and it didn't answer 304.
+func countsLate(status int, routed bool) bool {
+	return status >= 400 || (routed && status != http.StatusNotModified)
+}
+
+// fileTypes: a response's Content-Type that is a file's (an image, a font,
+// a script, a stylesheet, a video, a PDF, a download), what a route
+// serving files answers (http.FileServer, gin's Static, echo's Static).
+var fileTypes = regexp.MustCompile(`(?i)^(?:image|font|audio|video)/|^text/css|javascript|^application/(?:wasm|pdf|octet-stream|vnd\.ms-fontobject|(?:x-)?font)`)
+
+// routedToPage: whether the router sent a static-looking request to a
+// route of its own that isn't a file's. pattern: the route it took
+// (ServeMux's "GET /search/{q}", gin's FullPath, chi's RoutePattern, echo's
+// Path), "" when none. A pattern that is itself a file's by the static rule
+// ("/static/", "/assets/*filepath") is left alone, and so is a route that
+// answered a file's Content-Type (a file server under "/" or "/public/").
+func routedToPage(pattern, contentType string) bool {
+	if pattern == "" || fileTypes.MatchString(strings.TrimSpace(contentType)) {
+		return false
+	}
+	// ServeMux's "[METHOD ][HOST]/path": the path from its first "/".
+	if i := strings.IndexByte(pattern, '/'); i > 0 {
+		pattern = pattern[i:]
+	}
+	return !staticAsset(pattern, "")
 }
 
 // addressRule is steps 2 to 5: the address alone.
@@ -719,7 +969,7 @@ func (f *Firewall) checkAddress(in CheckInput) Decision {
 	return Decision{Action: action, Rule: rule, Status: http.StatusForbidden}
 }
 
-// needsCheck is step 7: the browser check is on, the request asks for a page
+// needsCheck is step 8: the browser check is on, the request asks for a page
 // outside skip, the address is in none of allow (already passed), goodbots
 // and exempt, and it has no valid pass.
 func (f *Firewall) needsCheck(rules *firewallRules, key ipKey, in CheckInput, now time.Time) bool {

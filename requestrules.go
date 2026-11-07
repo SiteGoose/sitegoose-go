@@ -471,43 +471,68 @@ func (s *ruleSection) hits(forms ...string) bool {
 	return false
 }
 
-// matchRequest is the first rule that matches, or nil. target is the request
-// target as the server received it, query string and all.
-func matchRequest(rules []*requestRule, method, target, userAgent string) *requestRule {
-	if len(rules) == 0 {
-		return nil
-	}
+// preparedRequest is a request's parts, prepared once for every request rule
+// and page limit: the method upper-cased, the path raw, decoded and routed,
+// the query raw and decoded, the user agent.
+type preparedRequest struct {
+	method, rawPath, decodedPath, routedPath, rawQuery, decodedQuery, ua string
+}
+
+// prepareRequest: target is the request target as the server received it,
+// query string and all.
+func prepareRequest(method, target, userAgent string) *preparedRequest {
 	pathPart, query := target, ""
 	if i := strings.IndexByte(target, '?'); i >= 0 {
 		pathPart, query = target[:i], target[i+1:]
 	}
 	pathPart = truncate(pathPart, maxRuleText)
 	query = truncate(query, maxRuleText)
-	rawPath := normalizeRulePath(pathPart)
-	rawQuery := strings.ToLower(query)
-	ua := strings.ToLower(truncate(userAgent, maxRuleText))
-	decodedPath := normalizeRulePath(truncate(decodeOnce(pathPart), maxRuleText))
-	// And as the router reads it: "/x;y/../admin" is "/admin" there, so a
-	// rule on "/admin" catches it; a hit on any of the three counts.
-	routedPath := truncate(routerPath(pathPart), maxRuleText)
-	// Lower-cased after decoding: %55NION decodes to "UNION", which a
-	// lower-cased "union select" rule would otherwise never see.
-	decodedQuery := strings.ToLower(truncate(decodeOnce(query), maxRuleText))
-	upper := strings.ToUpper(method)
+	return &preparedRequest{
+		method:      strings.ToUpper(method),
+		rawPath:     normalizeRulePath(pathPart),
+		decodedPath: normalizeRulePath(truncate(decodeOnce(pathPart), maxRuleText)),
+		// And as the router reads it: "/x;y/../admin" is "/admin" there, so a
+		// rule on "/admin" catches it; a hit on any of the three counts.
+		routedPath: truncate(routerPath(pathPart), maxRuleText),
+		rawQuery:   strings.ToLower(query),
+		// Lower-cased after decoding: %55NION decodes to "UNION", which a
+		// lower-cased "union select" rule would otherwise never see.
+		decodedQuery: strings.ToLower(truncate(decodeOnce(query), maxRuleText)),
+		ua:           strings.ToLower(truncate(userAgent, maxRuleText)),
+	}
+}
+
+// matches: every section the rule names matches the request.
+func (rule *requestRule) matches(req *preparedRequest) bool {
+	if len(rule.methods) > 0 && !containsString(rule.methods, req.method) {
+		return false
+	}
+	if s := rule.sections["path"]; s != nil && !s.hits(req.rawPath, req.decodedPath, req.routedPath) {
+		return false
+	}
+	if s := rule.sections["query"]; s != nil && !s.hits(req.rawQuery, req.decodedQuery) {
+		return false
+	}
+	if s := rule.sections["ua"]; s != nil && !s.hits(req.ua, req.ua) {
+		return false
+	}
+	return true
+}
+
+// matchRequest is the first rule that matches, or nil. target is the request
+// target as the server received it, query string and all.
+func matchRequest(rules []*requestRule, method, target, userAgent string) *requestRule {
+	if len(rules) == 0 {
+		return nil
+	}
+	return matchPrepared(rules, prepareRequest(method, target, userAgent))
+}
+
+func matchPrepared(rules []*requestRule, req *preparedRequest) *requestRule {
 	for _, rule := range rules {
-		if len(rule.methods) > 0 && !containsString(rule.methods, upper) {
-			continue
+		if rule.matches(req) {
+			return rule
 		}
-		if s := rule.sections["path"]; s != nil && !s.hits(rawPath, decodedPath, routedPath) {
-			continue
-		}
-		if s := rule.sections["query"]; s != nil && !s.hits(rawQuery, decodedQuery) {
-			continue
-		}
-		if s := rule.sections["ua"]; s != nil && !s.hits(ua, ua) {
-			continue
-		}
-		return rule
 	}
 	return nil
 }

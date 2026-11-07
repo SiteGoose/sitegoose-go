@@ -93,8 +93,14 @@ type PerformanceOptions struct {
 	// Route names a request's route your own way ("" falls back to the router's pattern).
 	Route func(r *http.Request) string
 	// DisableQueries keeps Server speed and leaves database queries out
-	// (OpenDB, WrapConnector, the pgx and Mongo hooks then record nothing).
+	// (OpenDB, WrapConnector, the pgx, Mongo and ClickHouse hooks then record nothing).
 	DisableQueries bool
+	// DisableCalls keeps Server speed and leaves outgoing calls out
+	// (p.Transport then only adds breadcrumbs).
+	DisableCalls bool
+	// DisableQueues keeps Server speed and leaves job queues out
+	// (p.WatchQueues and the asynq watcher then read nothing).
+	DisableQueues bool
 }
 
 type perfKey struct {
@@ -119,6 +125,48 @@ type performance struct {
 	rows       map[perfKey]*perfRow
 	job        *periodic
 	now        func() time.Time
+
+	// Requests in progress now, and the most at once since the resources
+	// module last asked. timed stays false until the middleware first runs,
+	// so an app that never installed it reports no peak rather than 0.
+	flightMu sync.Mutex
+	inflight int64
+	peak     int64
+	timed    bool
+}
+
+// started counts a request the middleware is now handling.
+func (p *performance) started() {
+	p.flightMu.Lock()
+	p.timed = true
+	p.inflight++
+	if p.inflight > p.peak {
+		p.peak = p.inflight
+	}
+	p.flightMu.Unlock()
+}
+
+// ended counts it done.
+func (p *performance) ended() {
+	p.flightMu.Lock()
+	if p.inflight > 0 {
+		p.inflight--
+	}
+	p.flightMu.Unlock()
+}
+
+// takeInflightPeak is the most requests in progress at once since the last
+// call, and starts the next interval at what is still in progress; false
+// until the middleware has seen a request.
+func (p *performance) takeInflightPeak() (int64, bool) {
+	p.flightMu.Lock()
+	defer p.flightMu.Unlock()
+	if !p.timed {
+		return 0, false
+	}
+	most := p.peak
+	p.peak = p.inflight
+	return most, true
 }
 
 func newPerformance(c *core, o PerformanceOptions) *performance {
@@ -216,14 +264,10 @@ func (p *performance) flush(ctx context.Context, everything bool) {
 		})
 	}
 	p.mu.Unlock()
-	for i := 0; i < len(rows); i += maxRows {
-		end := i + maxRows
-		if end > len(rows) {
-			end = len(rows)
-		}
+	inChunks(rows, func(part []map[string]any) {
 		p.core.send(ctx, "performance", "/events/server-requests", http.MethodPost,
-			map[string]any{"server_name": p.serverName, "runtime": runtimeName(), "rows": rows[i:end]}, authBody, nil)
-	}
+			map[string]any{"server_name": p.serverName, "runtime": runtimeName(), "rows": part}, authBody, nil)
+	})
 }
 
 func (p *performance) close(ctx context.Context) {

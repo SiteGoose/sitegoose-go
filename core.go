@@ -29,7 +29,7 @@ import (
 )
 
 // Version is the package's version, sent in the User-Agent.
-const Version = "0.3.3"
+const Version = "0.4.0"
 
 const (
 	sendTimeout = 5 * time.Second
@@ -159,6 +159,7 @@ type core struct {
 	serverName string
 	started    time.Time
 	client     *http.Client
+	ownHost    string // the collector's host, as calls.go names hosts
 
 	mu          sync.RWMutex
 	switches    map[string]bool
@@ -190,6 +191,9 @@ func newCore(siteID, secret, endpoint string, debug bool, serverName string) *co
 		flags:      map[string]flagRule{},
 	}
 	c.valid = siteIDPattern.MatchString(c.siteID) && c.secret != "" && c.endpoint != ""
+	if u, err := url.Parse(endpoint); err == nil {
+		c.ownHost = callHost(u)
+	}
 	// Our own client: an app's instrumented DefaultTransport (or our
 	// breadcrumb Transport) never sees, or slows, the package's own calls.
 	transport := http.DefaultTransport.(*http.Transport).Clone()
@@ -493,6 +497,19 @@ func goVersion() string {
 
 // runtimeName names the runtime as the dashboard shows it: "Go 1.23.4".
 func runtimeName() string { return truncate("Go "+goVersion(), 32) }
+
+// inChunks hands rows to send maxRows at a time, the most the collector
+// takes in one request.
+func inChunks(rows []map[string]any, send func(part []map[string]any)) {
+	for len(rows) > 0 {
+		n := len(rows)
+		if n > maxRows {
+			n = maxRows
+		}
+		send(rows[:n])
+		rows = rows[n:]
+	}
+}
 
 func isoMinute(t time.Time) string { return t.UTC().Format("2006-01-02T15:04:05.000Z") }
 

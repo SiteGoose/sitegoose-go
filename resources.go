@@ -1,7 +1,8 @@
 package sitegoose
 
 // How the machine is doing (sdk/protocols/resources.md): CPU, load, memory,
-// swap, disks, disk and network throughput and this process's memory,
+// swap, disks, disk and network throughput and this process's memory, and
+// how close the app is to a limit (limits.go),
 // sampled every minute and sent to POST /events/resources every few minutes.
 // The companion of Server speed: that says how the requests went, this says
 // whether the box can still serve them.
@@ -467,11 +468,32 @@ type resources struct {
 	job      *periodic
 	read     func(string) string
 	stat     func(string) (fsStat, bool)
+
+	// The limits pass (limits.go).
+	procKey       string
+	cgroup        *cgroupDirs
+	lastCgroup    *cgroupReading
+	lastOverflows optF
+	lastGC        optF // total GC pause, in ms
+	inflight      func() (int64, bool)
+	listFDs       func() (int64, bool)
+	goMemory      func() (int64, int64, bool)
+	gcPauses      func() (time.Duration, bool)
+	uptime        func() time.Duration
 }
 
-func newResources(c *core, o ResourcesOptions) *resources {
+func newResources(c *core, o ResourcesOptions) *resources { return newResourcesFor(c, o, nil) }
+
+// newResourcesFor: perf, when Server speed is on, gives the most requests
+// in progress at once.
+func newResourcesFor(c *core, o ResourcesOptions, perf *performance) *resources {
 	r := &resources{core: c, serverName: truncate(firstNonEmpty(o.ServerName, hostname()), 100),
-		rows: map[string]map[string]any{}, every: resourcesEvery, enabled: true, read: readText, stat: statFS}
+		rows: map[string]map[string]any{}, every: resourcesEvery, enabled: true, read: readText, stat: statFS,
+		procKey: newProcKey(), listFDs: openFiles, goMemory: goMemory, gcPauses: gcPauses,
+		uptime: func() time.Duration { return time.Since(processStart) }}
+	if perf != nil {
+		r.inflight = perf.takeInflightPeak
+	}
 	r.prime(time.Now())
 	r.sampler = c.every(sampleEvery, func() time.Duration {
 		r.sample(time.Now())
@@ -488,6 +510,60 @@ func (r *resources) prime(at time.Time) {
 	rx, tx, ok := netCounters(r.read("/proc/net/dev"))
 	r.lastNet, r.hasNet = [2]int64{rx, tx}, ok
 	r.lastAt = at
+	r.cgroup = findCgroup(r.read)
+	r.lastCgroup = readCgroup(r.cgroup, r.read)
+	r.lastOverflows = listenOverflows(r.read("/proc/net/netstat"))
+	if d, ok := r.gcPauses(); ok {
+		r.lastGC = have(float64(d) / float64(time.Millisecond))
+	}
+}
+
+// limitsRow is the limits pass for one sample: caps and counters diffed
+// against the previous sample's, the rest read once. Only sample calls it,
+// from the one sampling goroutine.
+func (r *resources) limitsRow(row map[string]any) map[string]any {
+	out := map[string]any{"proc_uptime_s": int64(r.uptime().Seconds())}
+	if r.procKey != "" {
+		out["proc_key"] = r.procKey
+	}
+	memTotal, _ := row["mem_total_mb"].(int64)
+	cores, _ := row["cpu_cores"].(int)
+	reading := readCgroup(r.cgroup, r.read)
+	for k, v := range cgroupFields(r.lastCgroup, reading, memTotal, cores) {
+		out[k] = v
+	}
+	r.lastCgroup = reading
+	for k, v := range pressureFields(r.read) {
+		out[k] = v
+	}
+	overflows := listenOverflows(r.read("/proc/net/netstat"))
+	if drops, ok := countSince(r.lastOverflows, overflows); ok {
+		out["listen_drops"] = int64(drops)
+	}
+	r.lastOverflows = overflows
+	if pct, ok := conntrackPct(r.read); ok {
+		out["conntrack_pct"] = pct
+	}
+	for k, v := range fileFields(r.read, r.listFDs) {
+		out[k] = v
+	}
+	for k, v := range heapFields(r.goMemory) {
+		out[k] = v
+	}
+	gc := optF{}
+	if d, ok := r.gcPauses(); ok {
+		gc = have(float64(d) / float64(time.Millisecond))
+	}
+	if ms, ok := countSince(r.lastGC, gc); ok {
+		out["gc_ms"] = round(ms, 1)
+	}
+	r.lastGC = gc
+	if r.inflight != nil {
+		if peak, ok := r.inflight(); ok && peak >= 0 {
+			out["inflight_peak"] = peak
+		}
+	}
+	return out
 }
 
 // sample takes one sample, covering the time since the last one.
@@ -540,6 +616,9 @@ func (r *resources) sample(at time.Time) map[string]any {
 	}
 	if up, ok := hostUptime(r.read("/proc/uptime")); ok {
 		row["host_uptime_s"] = up
+	}
+	for k, v := range r.limitsRow(row) {
+		row[k] = v
 	}
 	r.mu.Lock()
 	if !r.enabled {

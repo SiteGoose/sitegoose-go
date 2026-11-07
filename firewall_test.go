@@ -433,7 +433,4 @@ func TestRoutedPaths(t *testing.T) {
 			t.Errorf("%s isn't a probe", target)
 		}
 	}
-	if staticAsset("/admin;x.css") || !staticAsset("/static/app") || !staticAsset("/a/b.WASM") {
-		t.Fatal("static")
-	}
 }
