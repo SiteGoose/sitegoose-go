@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -74,6 +75,9 @@ type queueWatch struct {
 	job     *periodic
 	started sync.Once
 	now     func() time.Time
+	// asynqReading counts the asynq readings running now: their Redis
+	// commands are this package's own, not the app's (ownRedis).
+	asynqReading atomic.Int32
 }
 
 func newQueueWatch(c *core, perf *performance) *queueWatch {
@@ -174,7 +178,9 @@ func (q *queueWatch) readWithin(ctx context.Context, r *queueReader) ([]QueueRea
 		rows []QueueReading
 		err  error
 	}
-	ctx, cancel := context.WithTimeout(ctx, queueReadWait)
+	// The reading's queries and Redis commands are this package's own, not
+	// the app's: a hook on the same client leaves them out.
+	ctx, cancel := context.WithTimeout(markTimed(ctx), queueReadWait)
 	defer cancel()
 	done := make(chan result, 1)
 	go func() {
@@ -189,6 +195,10 @@ func (q *queueWatch) readWithin(ctx context.Context, r *queueReader) ([]QueueRea
 			q.mu.Unlock()
 			done <- res
 		}()
+		if r.system == "asynq" {
+			q.asynqReading.Add(1)
+			defer q.asynqReading.Add(-1)
+		}
 		res.rows, res.err = r.read(ctx)
 	}()
 	select {

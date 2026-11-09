@@ -19,6 +19,7 @@ package sitegoose
 import (
 	"context"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -142,7 +143,7 @@ func timedOutside(ctx context.Context) bool {
 // RecordQuery counts one database query the app ran, for a database library
 // this package has no hook for: db is "postgresql", "mysql", "mariadb",
 // "sqlite", "mssql", "oracle", "clickhouse" or "mongodb" (anything else is
-// "other"), and
+// "other"; Redis commands go through RecordRedis), and
 // statement the query as run. Its values are taken out here, before it is
 // counted; bound parameters are never asked for. ctx is the one the query
 // was given: the request (or p.Job) it belongs to, else it counts as a
@@ -165,6 +166,77 @@ func (p *Platform) RecordQuery(ctx context.Context, db, statement string, d time
 		return
 	}
 	p.queries.record(ctx, p, db, statement, float64(d)/float64(time.Millisecond), err != nil)
+}
+
+// RecordRedis counts one Redis command the app ran, as database "redis":
+// args is the command as sent to the server (["SET", "session:abc", value,
+// "EX", 60]), of which only the name, a subcommand and the first key's shape
+// are kept ("SET session:?"), never a value. Strings and []byte are read;
+// anything else is a value. Blocking commands (BLPOP, XREAD BLOCK...) wait
+// rather than work and aren't counted. err is an error reply or no answer
+// (a connection error, a timeout); a nil reply is an answer, so pass nil for
+// it. The redis submodule does this for go-redis.
+func (p *Platform) RecordRedis(ctx context.Context, args []any, d time.Duration, err error) {
+	if p == nil || p.queries == nil || timedOutside(ctx) {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			p.core.log("performance", "could not count a Redis command: %v", r)
+		}
+	}()
+	if !p.core.isOn(ModulePerformance) {
+		return
+	}
+	statement, ok := redisCommand(args)
+	if !ok || p.ownRedis(statement) {
+		return
+	}
+	p.queries.record(ctx, p, "redis", cutStatement(statement), float64(d)/float64(time.Millisecond), err != nil)
+}
+
+// RecordRedisPipeline counts commands sent together as one call, for the
+// whole round trip: "PIPELINE " and the statement of the first command
+// RecordRedis would count, or with transaction "MULTI " (the MULTI and EXEC
+// around the commands are passed over). err is the round trip's error or
+// any command's error reply. A pipeline of nothing but blocking commands
+// isn't counted.
+func (p *Platform) RecordRedisPipeline(ctx context.Context, cmds [][]any, transaction bool, d time.Duration, err error) {
+	if p == nil || p.queries == nil || timedOutside(ctx) {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			p.core.log("performance", "could not count a Redis pipeline: %v", r)
+		}
+	}()
+	if !p.core.isOn(ModulePerformance) {
+		return
+	}
+	prefix := "PIPELINE "
+	if transaction {
+		prefix = "MULTI "
+	}
+	for _, args := range cmds {
+		statement, ok := redisCommand(args)
+		if !ok || (transaction && (statement == "MULTI" || statement == "EXEC")) {
+			continue
+		}
+		if p.ownRedis(statement) {
+			return
+		}
+		p.queries.record(ctx, p, "redis", cutStatement(prefix+statement), float64(d)/float64(time.Millisecond), err != nil)
+		return
+	}
+}
+
+// ownRedis: a command of asynq's Inspector while this package reads the
+// queues through it. The Inspector reads with context.Background(), so the
+// reading's marked ctx can't reach a hook on the app's own client; its keys
+// all start "asynq:". An app's own asynq command in those few milliseconds
+// a minute goes uncounted too.
+func (p *Platform) ownRedis(statement string) bool {
+	return p.queueRead != nil && p.queueRead.asynqReading.Load() > 0 && strings.Contains(statement, " asynq:")
 }
 
 // record files one query (a: database, b: statement) or call (a: call

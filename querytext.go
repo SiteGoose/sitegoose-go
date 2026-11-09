@@ -12,6 +12,8 @@ package sitegoose
 import (
 	"bytes"
 	"encoding/json"
+	"math"
+	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
@@ -26,7 +28,7 @@ const (
 
 // databases a row may name; anything else is "other".
 var databases = map[string]bool{"postgresql": true, "mysql": true, "mariadb": true, "sqlite": true, "mssql": true,
-	"oracle": true, "clickhouse": true, "mongodb": true, "other": true}
+	"oracle": true, "clickhouse": true, "mongodb": true, "redis": true, "other": true}
 
 // databaseOf lower-cases as JavaScript's toLowerCase does for these names:
 // the Kelvin sign is a k, but İ is "i̇" (two characters) where Go's
@@ -468,6 +470,9 @@ func normalizeStatement(text, db string) string {
 	if db == "mongodb" {
 		return cutStatement(mongoStatement(text))
 	}
+	if db == "redis" {
+		return cutStatement(redisStatement(text))
+	}
 	if db == "other" && strings.ContainsRune(text, '\\') {
 		// A database we don't know may or may not take a backslash as an
 		// escape, and each reading leaks what the other hides. When they
@@ -480,4 +485,362 @@ func normalizeStatement(text, db string) string {
 		return cutStatement(escaped)
 	}
 	return cutStatement(sqlShape(text, db))
+}
+
+// ---- Redis ----
+
+// Redis: the command and its first key's shape, never an argument or value
+// (queries.md, "Redis"). A key keeps each ":" segment that is only letters
+// and "_" (32 at most); every other segment is "?", so IDs, slugs, emails and
+// hashes never leave the server: user:42:cart -> user:?:cart. ASCII only,
+// as the reference's regexes are.
+
+func redisSet(names ...string) map[string]bool {
+	m := make(map[string]bool, len(names))
+	for _, n := range names {
+		m[n] = true
+	}
+	return m
+}
+
+var (
+	// Commands whose second word is a subcommand (CLIENT SETNAME, XINFO STREAM).
+	redisContainers = redisSet("ACL", "CLIENT", "CLUSTER", "COMMAND", "CONFIG", "DEBUG", "FUNCTION", "LATENCY", "MEMORY",
+		"MODULE", "OBJECT", "PUBSUB", "SCRIPT", "SLOWLOG", "XGROUP", "XINFO")
+	// Of those, the ones with a key after the subcommand.
+	redisSubKey = redisSet("OBJECT", "MEMORY", "XGROUP", "XINFO")
+	// No key: what follows is a password, a message, a number or nothing.
+	redisNoKey = redisSet("PING", "ECHO", "INFO", "AUTH", "HELLO", "SELECT", "QUIT", "RESET", "MULTI", "EXEC", "DISCARD",
+		"UNWATCH", "DBSIZE", "TIME", "FLUSHDB", "FLUSHALL", "SAVE", "BGSAVE", "BGREWRITEAOF", "LASTSAVE", "SCAN",
+		"RANDOMKEY", "SWAPDB", "SHUTDOWN", "ROLE", "REPLICAOF", "SLAVEOF", "READONLY", "READWRITE", "LOLWUT", "FAILOVER",
+		"PSYNC", "SYNC", "REPLCONF", "MIGRATE")
+	// Script calls: script or name, then how many keys, then the keys.
+	redisScripts = redisSet("EVAL", "EVALSHA", "EVAL_RO", "EVALSHA_RO", "FCALL", "FCALL_RO")
+	// How many keys first, then the keys.
+	redisNumkeys = redisSet("ZUNION", "ZINTER", "ZDIFF", "SINTERCARD", "ZINTERCARD", "LMPOP", "ZMPOP")
+	// Waiting, not working: a queue worker sits in these for seconds, so
+	// timing them would put every idle worker at the top of the slow list.
+	redisWaiting = redisSet("BLPOP", "BRPOP", "BRPOPLPUSH", "BLMOVE", "BLMPOP", "BZPOPMIN", "BZPOPMAX", "BZMPOP", "WAIT",
+		"WAITAOF", "SUBSCRIBE", "PSUBSCRIBE", "SSUBSCRIBE", "UNSUBSCRIBE", "PUNSUBSCRIBE", "SUNSUBSCRIBE", "MONITOR")
+	redisPrefixes = redisSet("PIPELINE", "MULTI")
+)
+
+func qIsLetter(c byte) bool { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') }
+
+// redisWord: /^[A-Za-z][A-Za-z0-9_.|-]{0,39}$/, a command or subcommand name.
+func redisWord(s string) bool {
+	if len(s) == 0 || len(s) > 40 || !qIsLetter(s[0]) {
+		return false
+	}
+	for i := 1; i < len(s); i++ {
+		c := s[i]
+		if !qIsLetter(c) && !(c >= '0' && c <= '9') && c != '_' && c != '.' && c != '|' && c != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+// redisSegment: /^[A-Za-z_]{1,32}$/, a key segment kept as it is.
+func redisSegment(s string) bool {
+	if len(s) == 0 || len(s) > 32 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if !qIsLetter(s[i]) && s[i] != '_' {
+			return false
+		}
+	}
+	return true
+}
+
+// asciiUpper upper-cases a-z only, as the reference does; Go's
+// strings.ToUpper would turn other letters too.
+func asciiUpper(s string) string {
+	i := 0
+	for i < len(s) && !(s[i] >= 'a' && s[i] <= 'z') {
+		i++
+	}
+	if i == len(s) {
+		return s
+	}
+	b := []byte(s)
+	for ; i < len(b); i++ {
+		if b[i] >= 'a' && b[i] <= 'z' {
+			b[i] -= 'a' - 'A'
+		}
+	}
+	return string(b)
+}
+
+// asciiUpperIs: asciiUpper(s) == upper, without making the string.
+func asciiUpperIs(s, upper string) bool {
+	if len(s) != len(upper) {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 'a' && c <= 'z' {
+			c -= 'a' - 'A'
+		}
+		if c != upper[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// redisArg is an argument as a string: a string, or []byte decoded.
+// Anything else (a number, a value of the app's) isn't one.
+func redisArg(v any) (string, bool) {
+	switch s := v.(type) {
+	case string:
+		return s, true
+	case []byte:
+		return string(s), true
+	}
+	return "", false
+}
+
+// redisKeyShape keeps the key's letter-only segments; a key that isn't a
+// string is "?".
+func redisKeyShape(key any) string {
+	s, ok := redisArg(key)
+	if !ok || s == "" {
+		// An empty key is "?" too: "GET " would come back from the collector as "GET".
+		return "?"
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for {
+		i := strings.IndexByte(s, ':')
+		part := s
+		if i >= 0 {
+			part = s[:i]
+		}
+		if part == "" || redisSegment(part) {
+			b.WriteString(part)
+		} else {
+			b.WriteByte('?')
+		}
+		if i < 0 {
+			return b.String()
+		}
+		b.WriteByte(':')
+		s = s[i+1:]
+	}
+}
+
+// jsNumberPositive is JavaScript's Number(v) > 0, for a count of keys.
+func jsNumberPositive(v any) bool {
+	if s, ok := redisArg(v); ok {
+		return jsStringNumber(s) > 0
+	}
+	switch n := v.(type) {
+	case nil:
+		return false
+	case bool:
+		return n
+	}
+	r := reflect.ValueOf(v)
+	switch r.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return r.Int() > 0
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return r.Uint() > 0
+	case reflect.Float32, reflect.Float64:
+		return r.Float() > 0
+	}
+	return false
+}
+
+// jsStringNumber is JavaScript's Number(s) as far as its sign: NaN for
+// anything it doesn't read, and a 0x, 0o or 0b number only 1 or 0.
+func jsStringNumber(s string) float64 {
+	s = qTrimJS(s)
+	if s == "" {
+		return 0
+	}
+	if len(s) > 2 && s[0] == '0' {
+		base := 0
+		switch s[1] {
+		case 'x', 'X':
+			base = 16
+		case 'o', 'O':
+			base = 8
+		case 'b', 'B':
+			base = 2
+		}
+		if base > 0 {
+			nonzero := false
+			for i := 2; i < len(s); i++ {
+				d := -1
+				switch c := s[i]; {
+				case c >= '0' && c <= '9':
+					d = int(c - '0')
+				case c >= 'a' && c <= 'f':
+					d = int(c-'a') + 10
+				case c >= 'A' && c <= 'F':
+					d = int(c-'A') + 10
+				}
+				if d < 0 || d >= base {
+					return math.NaN()
+				}
+				nonzero = nonzero || d > 0
+			}
+			if nonzero {
+				return 1
+			}
+			return 0
+		}
+	}
+	sign, t := 1.0, s
+	if t[0] == '+' || t[0] == '-' {
+		if t[0] == '-' {
+			sign = -1
+		}
+		t = t[1:]
+	}
+	if t == "Infinity" {
+		return sign * math.Inf(1)
+	}
+	// (\d+\.?\d*|\.\d+)([eE][+-]?\d+)?
+	i, digits := 0, 0
+	for i < len(t) && qIsDigit(rune(t[i])) {
+		i, digits = i+1, digits+1
+	}
+	if i < len(t) && t[i] == '.' {
+		i++
+		for i < len(t) && qIsDigit(rune(t[i])) {
+			i, digits = i+1, digits+1
+		}
+	}
+	if digits == 0 {
+		return math.NaN()
+	}
+	if i < len(t) && (t[i] == 'e' || t[i] == 'E') {
+		i++
+		if i < len(t) && (t[i] == '+' || t[i] == '-') {
+			i++
+		}
+		exp := i
+		for i < len(t) && qIsDigit(rune(t[i])) {
+			i++
+		}
+		if i == exp {
+			return math.NaN()
+		}
+	}
+	if i != len(t) {
+		return math.NaN()
+	}
+	f, _ := strconv.ParseFloat(t, 64) // out of range is ±Inf or 0, as in JavaScript
+	return sign * f
+}
+
+// redisWordIs: the argument, a string or []byte, is word (upper-cased).
+func redisWordIs(arg any, word string) bool {
+	s, ok := redisArg(arg)
+	return ok && asciiUpperIs(s, word)
+}
+
+// redisCommand is a command as the client sends it (["GET", "user:42"]) ->
+// "GET user:?", or false for one that isn't timed (blocking, or not a
+// command). What a package sends is this; the collector checks it with
+// redisStatement.
+func redisCommand(args []any) (string, bool) {
+	if len(args) == 0 {
+		return "", false
+	}
+	first, ok := redisArg(args[0])
+	if !ok || !redisWord(first) {
+		return "", false
+	}
+	name := asciiUpper(first)
+	if redisWaiting[name] {
+		return "", false
+	}
+	xread := name == "XREAD" || name == "XREADGROUP"
+	command, key := name, -1
+	switch {
+	case redisContainers[name]:
+		if len(args) > 1 {
+			if sub, ok := redisArg(args[1]); ok && redisWord(sub) {
+				command = name + " " + asciiUpper(sub)
+				// Only after a subcommand: "OBJECT user" would read back as OBJECT USER.
+				if redisSubKey[name] {
+					key = 2
+				}
+			}
+		}
+	case redisScripts[name]:
+		if len(args) > 2 && jsNumberPositive(args[2]) {
+			key = 3
+		}
+	case redisNumkeys[name]:
+		if len(args) > 1 && jsNumberPositive(args[1]) {
+			key = 2
+		}
+	case name == "BITOP":
+		key = 2
+	case xread:
+		// Its options, then STREAMS and the keys. XREADGROUP's group and
+		// consumer come first and may be named anything, as may a stream
+		// ("block").
+		from := 1
+		if name == "XREADGROUP" {
+			from = 4
+		}
+		for i := from; i < len(args); i++ {
+			if redisWordIs(args[i], "BLOCK") {
+				return "", false
+			}
+			if redisWordIs(args[i], "STREAMS") {
+				key = i + 1
+				break
+			}
+		}
+	case !redisNoKey[name] && !redisPrefixes[name]:
+		key = 1
+	}
+	if key >= 0 && key < len(args) {
+		return command + " " + redisKeyShape(args[key]), true
+	}
+	return command, true
+}
+
+// redisStatement checks a statement a package sent:
+// [PIPELINE|MULTI] COMMAND [SUBCOMMAND] [key]. Anything else (an argument
+// a package let through) is (other).
+func redisStatement(text string) string {
+	words := strings.FieldsFunc(text, qJsSpace)
+	if len(words) == 0 {
+		return ""
+	}
+	out := make([]string, 0, 4)
+	i := 0
+	if first := asciiUpper(words[0]); redisPrefixes[first] && len(words) > 1 {
+		out = append(out, first)
+		i++
+	}
+	if !redisWord(words[i]) {
+		return otherStatement
+	}
+	name := asciiUpper(words[i])
+	i++
+	if redisWaiting[name] {
+		return otherStatement
+	}
+	out = append(out, name)
+	if redisContainers[name] && i < len(words) && redisWord(words[i]) {
+		out = append(out, asciiUpper(words[i]))
+		i++
+	}
+	if i < len(words)-1 {
+		return otherStatement
+	}
+	if i < len(words) {
+		out = append(out, redisKeyShape(words[i]))
+	}
+	return strings.Join(out, " ")
 }

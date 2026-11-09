@@ -12,6 +12,7 @@ go get github.com/sitegoose/sitegoose-go/echo   # echo apps
 go get github.com/sitegoose/sitegoose-go/chi    # chi apps
 go get github.com/sitegoose/sitegoose-go/pgx    # pgx's own query timing
 go get github.com/sitegoose/sitegoose-go/mongo  # MongoDB driver v2
+go get github.com/sitegoose/sitegoose-go/redis  # go-redis v9 commands
 ```
 
 ## net/http
@@ -117,7 +118,19 @@ client, err := mongo.Connect(options.Client().ApplyURI(uri).SetMonitor(sitegoose
 // ClickHouse (clickhouse-go v2), its native API: go get github.com/sitegoose/sitegoose-go/clickhouse
 conn, err := clickhouse.Open(&clickhouse.Options{Addr: []string{"127.0.0.1:9000"}})
 conn = sitegooseclickhouse.Wrap(p, conn)
+
+// Redis (go-redis v9): go get github.com/sitegoose/sitegoose-go/redis
+rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379"}) // or a ClusterClient, Ring, UniversalClient
+rdb.AddHook(sitegooseredis.Hook(p))
 ```
+
+Redis commands keep only the command and the first key's shape, never a
+value: `GET user:?:cart`, `SET session:?`. A pipeline is one call for its
+round trip (`PIPELINE GET user:?`), a `TxPipeline` `MULTI …`. A nil reply
+isn't a failure; an error reply or no answer is. Blocking commands (`BLPOP`,
+`XREAD BLOCK`…) wait rather than work and aren't counted, nor are this
+package's own asynq queue readings on the same client. Another Redis
+library: `p.RecordRedis(ctx, args, elapsed, err)`.
 
 The database is told from the driver (`pgx`, `postgres`, `mysql`, `sqlite3`,
 `sqlite`, `sqlserver`, `godror`, `clickhouse`...): ClickHouse through
