@@ -427,6 +427,49 @@ func TestDashboardHeadersMustBeHarmless(t *testing.T) {
 	}
 }
 
+// Only the nine the dashboard can produce, against the cases every client
+// shares: sdk/protocols/header-cases.json.
+func TestDashboardHeadersSharedCases(t *testing.T) {
+	var file struct {
+		Cases []struct {
+			Name, Value string
+			Repeat      int
+			OK          bool
+		}
+	}
+	readShared(t, "header-cases.json", &file)
+	for _, c := range file.Cases {
+		value := c.Value
+		if c.Repeat > 0 {
+			value = strings.Repeat(c.Value, c.Repeat)
+		}
+		if got := safeHeader(c.Name, value); got != c.OK {
+			t.Errorf("%q: %q x%d = %v, want %v", c.Name, c.Value, c.Repeat, got, c.OK)
+		}
+	}
+}
+
+// The type a collector answer is served with from the site's own domain,
+// against the cases every client shares: sdk/protocols/proxy-answer-cases.json.
+func TestProxyAnswerSharedCases(t *testing.T) {
+	var file struct {
+		Cases []struct {
+			Type   *string
+			Served string
+		}
+	}
+	readShared(t, "proxy-answer-cases.json", &file)
+	for _, c := range file.Cases {
+		given := ""
+		if c.Type != nil {
+			given = *c.Type
+		}
+		if got := answerType(given); got != c.Served {
+			t.Errorf("%q served as %q, want %q", given, got, c.Served)
+		}
+	}
+}
+
 func TestCloseWithoutADeadlineStillEnds(t *testing.T) {
 	stuck := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		select {

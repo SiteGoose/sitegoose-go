@@ -93,6 +93,24 @@ never stops a request.
 | `resources` | CPU, load, memory, disks, network (Linux /proc), and how close the app is to a limit (below) | |
 | `proxy` | The tracker and its beacon on the site's own domain: `p.Proxy().ScriptURL("")`, `p.Proxy().CollectURL()`. Denied and banned addresses are turned away first; a held tracker file is served at once and refreshed behind it; beacons time out after 3 s, and after five failures in a row are answered at once for 30 s | `Proxy: ProxyOptions{Prefix}` |
 
+## Server analytics
+
+For what only your server knows for sure. Not pageviews: the tracker counts
+those. The visit comes from the request's context (the page's
+`X-Analytics-Session` header), so pass `r.Context()`:
+
+```go
+p.Track(r.Context(), "purchase", map[string]any{"numeric_value": "49.90", "currency": "EUR", "event_uid": "order-" + order.ID})
+p.Identify(r.Context(), user.ID, "", sitegoose.Traits{"plan": "pro", "seats": 5, "trial": false}) // traits are optional
+p.Lead(r.Context(), map[string]any{"email": "ana@example.com", "name": "Ana", "status": "qualified"})
+```
+
+`Identify`'s traits are name to text, a number or a bool; other values are
+left out (and so is `traits` when nothing is left). The collector does the
+rest: names are lowercased with spaces and dashes as `_` (up to 40 letters,
+digits and `_`), text is cut at 200 characters, values that look like an
+email address are dropped, and at most 20 are kept.
+
 ## Database queries
 
 Server speed → Queries shows how many queries each route ran and how long

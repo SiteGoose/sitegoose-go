@@ -453,13 +453,19 @@ func (p *Platform) Track(ctx context.Context, name string, fields map[string]any
 	return p.analytics.track(ctx, name, fields)
 }
 
+// Traits are what you know about a user, for Identify: name to text, a
+// number or a bool (Traits{"plan": "pro", "seats": 5}). Other values are
+// left out; the collector cleans the names and values.
+type Traits map[string]any
+
 // Identify links the visit (sessionID, else the request ctx belongs to) to
 // your user ID; true when stored. Waits for the answer, up to 5 seconds.
-func (p *Platform) Identify(ctx context.Context, userID, sessionID string) bool {
+// traits is optional (several are merged, a later name winning).
+func (p *Platform) Identify(ctx context.Context, userID, sessionID string, traits ...Traits) bool {
 	if p.analytics == nil {
 		return false
 	}
-	return p.analytics.identify(ctx, userID, sessionID)
+	return p.analytics.identify(ctx, userID, sessionID, traits)
 }
 
 // Lead adds or updates a lead (fields: email or phone, and name, status,

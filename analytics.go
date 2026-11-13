@@ -7,7 +7,8 @@ package sitegoose
 //   - Track: events, batched to POST /events/server-events in the
 //     background. Each gets an event_uid, so a retried batch can be told
 //     apart from new events.
-//   - Identify: links the browser's visit to your user ID (/events/identify).
+//   - Identify: links the browser's visit to your user ID (/events/identify),
+//     with optional traits about the user (plan, seats...).
 //   - Lead: adds or updates a lead (/events/lead).
 //
 // Identify and Lead wait for the answer (up to 5 seconds). The visit comes
@@ -19,7 +20,9 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
+	"reflect"
 	"strconv"
 	"sync"
 	"time"
@@ -141,16 +144,44 @@ func (a *analytics) flush(ctx context.Context) bool {
 	return ok
 }
 
-func (a *analytics) identify(ctx context.Context, userID, sessionID string) bool {
+func (a *analytics) identify(ctx context.Context, userID, sessionID string, traits []Traits) bool {
 	if sessionID == "" {
 		sessionID = sessionFrom(ctx)
 	}
 	if userID == "" || sessionID == "" || !a.core.isOn(ModuleAnalytics) {
 		return false
 	}
-	res := a.core.send(ctx, "analytics", "/events/identify", http.MethodPost,
-		map[string]any{"user_id": userID, "session_id": sessionID}, authBody, nil)
+	body := map[string]any{"user_id": userID, "session_id": sessionID}
+	if kept := scalarTraits(traits); len(kept) > 0 {
+		body["traits"] = kept
+	}
+	res := a.core.send(ctx, "analytics", "/events/identify", http.MethodPost, body, authBody, nil)
 	return res.ok()
+}
+
+// scalarTraits merges the traits maps, keeping the values that are text, a
+// number (a finite one) or a bool, named types of those too. The collector
+// cleans the names and values.
+func scalarTraits(traits []Traits) map[string]any {
+	kept := map[string]any{}
+	for _, t := range traits {
+		for name, value := range t {
+			if value == nil {
+				continue
+			}
+			switch v := reflect.ValueOf(value); v.Kind() {
+			case reflect.String, reflect.Bool,
+				reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+				reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+				kept[name] = value
+			case reflect.Float32, reflect.Float64:
+				if f := v.Float(); !math.IsNaN(f) && !math.IsInf(f, 0) {
+					kept[name] = value
+				}
+			}
+		}
+	}
+	return kept
 }
 
 func (a *analytics) lead(ctx context.Context, fields map[string]any) *LeadResult {

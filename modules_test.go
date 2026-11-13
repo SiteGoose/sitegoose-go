@@ -6,11 +6,13 @@ package sitegoose
 import (
 	"context"
 	"encoding/json"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -493,8 +495,36 @@ func TestTrackIdentifyLead(t *testing.T) {
 	if id["user_id"] != "user-7" || id["session_id"] != "visit-9" || id["sitesecret"] != "test-secret" {
 		t.Fatal(id)
 	}
+	if _, has := id["traits"]; has {
+		t.Fatal("traits without any passed", id)
+	}
 	if c.requests("/events/lead")[0].body["session_id"] != "visit-9" {
 		t.Fatal("lead session")
+	}
+}
+
+func TestIdentifyTraits(t *testing.T) {
+	c := newCollector(t)
+	c.json("/events/identify", 200, map[string]any{"ok": true})
+	p := New(Options{SiteID: testSite, Secret: "test-secret", Endpoint: c.server.URL, Disable: allBut(ModuleAnalytics)})
+	defer p.Close(context.Background())
+	type plan string
+	ctx := context.Background()
+	if !p.Identify(ctx, "user-7", "visit-9", Traits{"plan": plan("pro"), "Seats": 5, "ratio": 0.5, "trial": false,
+		"tags": []string{"a"}, "meta": map[string]any{"a": 1}, "gone": nil, "bad": math.NaN()}) {
+		t.Fatal("identify")
+	}
+	if !p.Identify(ctx, "user-7", "visit-9", Traits{"tags": []string{"a"}}) {
+		t.Fatal("identify, nothing scalar")
+	}
+	got := c.requests("/events/identify")
+	traits, _ := got[0].body["traits"].(map[string]any)
+	want := map[string]any{"plan": "pro", "Seats": float64(5), "ratio": 0.5, "trial": false}
+	if !reflect.DeepEqual(traits, want) {
+		t.Fatal(got[0].body)
+	}
+	if _, has := got[1].body["traits"]; has {
+		t.Fatal("traits with nothing scalar left", got[1].body)
 	}
 }
 

@@ -29,7 +29,7 @@ import (
 )
 
 // Version is the package's version, sent in the User-Agent.
-const Version = "0.4.1"
+const Version = "0.4.2"
 
 const (
 	sendTimeout = 5 * time.Second
@@ -42,8 +42,7 @@ const (
 )
 
 var (
-	siteIDPattern     = regexp.MustCompile(`^[a-fA-F0-9]{24}$`)
-	headerNamePattern = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9-]{0,63}$`)
+	siteIDPattern = regexp.MustCompile(`^[a-fA-F0-9]{24}$`)
 )
 
 type response struct {
@@ -414,16 +413,21 @@ func (c *core) syncSwitches() time.Duration {
 	return wait
 }
 
-// framingHeaders say how the answer is sent or who it is for: never set
-// from the dashboard, whatever it sends.
-var framingHeaders = map[string]bool{"Content-Length": true, "Transfer-Encoding": true, "Connection": true,
-	"Keep-Alive": true, "Upgrade": true, "Te": true, "Trailer": true, "Proxy-Connection": true, "Set-Cookie": true,
-	"Host": true, "Content-Type": true, "Content-Encoding": true, "Location": true, "Date": true, "Status": true}
+// securityHeaders are the nine the dashboard can produce
+// (expresscollect/Analytics/platform.js, headersOf), lower case. A list of
+// what's allowed, not of what isn't: whoever got into our servers still
+// couldn't make this app grant another site its users' data
+// (Access-Control-Allow-*), send every page elsewhere (Refresh), log everyone
+// out (Clear-Site-Data) or change what a response is. Shared cases:
+// sdk/protocols/header-cases.json.
+var securityHeaders = map[string]bool{"strict-transport-security": true, "x-content-type-options": true,
+	"x-frame-options": true, "referrer-policy": true, "permissions-policy": true, "cross-origin-opener-policy": true,
+	"content-security-policy": true, "content-security-policy-report-only": true, "reporting-endpoints": true}
 
-// safeHeader: a well-formed name that isn't a framing header, and a value
-// of visible ASCII, spaces and tabs only (no line breaks, nothing else).
+// safeHeader: one of securityHeaders, in any case, with a value of visible
+// ASCII, spaces and tabs only (no line breaks, nothing else).
 func safeHeader(name, value string) bool {
-	if !headerNamePattern.MatchString(name) || framingHeaders[http.CanonicalHeaderKey(name)] || len(value) > 4000 {
+	if !securityHeaders[strings.ToLower(name)] || len(value) > 4000 {
 		return false
 	}
 	for i := 0; i < len(value); i++ {

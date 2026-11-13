@@ -55,8 +55,28 @@ var (
 	safeProxyPath = regexp.MustCompile(`^[A-Za-z0-9/_.-]{1,120}$`)
 	trackerPath   = regexp.MustCompile(`^v(\d+(?:\.\d+\.\d+)?)/([a-z]+\.js)$`)
 	prefixChars   = regexp.MustCompile(`[^A-Za-z0-9_-]`)
-	answerHeaders = []string{"Content-Type", "Cache-Control", "Retry-After"}
+	answerHeaders = []string{"Cache-Control", "Retry-After"}
 )
+
+// answerTypes are what a collector answer may be served as from the site's
+// own domain. Its type comes from the collector, so anything else becomes
+// plain text, and nosniff stops a browser guessing: a server that is no
+// longer ours still can't answer <prefix>/api/... with a page that runs as
+// the customer's own site. Shared cases: sdk/protocols/proxy-answer-cases.json.
+var answerTypes = map[string]bool{"application/json": true, "text/plain": true, "image/webp": true}
+
+func answerType(value string) string {
+	kind, _, _ := strings.Cut(value, ";")
+	if !answerTypes[strings.ToLower(strings.TrimSpace(kind))] {
+		return "text/plain; charset=utf-8"
+	}
+	for i := 0; i < len(value); i++ {
+		if value[i] < 0x20 || value[i] > 0x7e {
+			return "text/plain; charset=utf-8"
+		}
+	}
+	return value
+}
 
 func proxyPrefixFor(secret string) string {
 	sum := sha256.Sum256([]byte("proxy|" + secret))
@@ -345,6 +365,8 @@ func (p *Proxy) collector(rest string, r *http.Request, clientIP string) proxyAn
 	defer res.Body.Close()
 	data, _ := io.ReadAll(io.LimitReader(res.Body, maxProxyBody))
 	h := http.Header{}
+	h.Set("Content-Type", answerType(res.Header.Get("Content-Type")))
+	h.Set("X-Content-Type-Options", "nosniff")
 	for _, name := range answerHeaders {
 		if v := res.Header.Get(name); v != "" {
 			h.Set(name, v)
