@@ -29,7 +29,7 @@ import (
 )
 
 // Version is the package's version, sent in the User-Agent.
-const Version = "0.4.2"
+const Version = "0.4.3"
 
 const (
 	sendTimeout = 5 * time.Second
