@@ -26,7 +26,7 @@ func newFake(t *testing.T) *fake {
 	f := &fake{rows: map[string][]map[string]any{}}
 	f.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/events/firewall/rules" {
-			w.Write([]byte(`{"v":1,"enabled":true,"mode":"block","deny":["198.51.100.7"]}`))
+			w.Write([]byte(`{"v":1,"enabled":true,"mode":"block","deny":["198.51.100.7"],"probes":{"exact":["/.env"],"ban":600}}`))
 			return
 		}
 		data, _ := io.ReadAll(r.Body)
@@ -78,6 +78,21 @@ func TestChi(t *testing.T) {
 	}
 	if w := do("/orders/2", "203.0.113.1"); w.Body.String() != "order" {
 		t.Fatal(w.Code)
+	}
+	// A probe another site made the browser send is refused, and bans no one.
+	probe := func(site string) int {
+		req := httptest.NewRequest("GET", "/.env", nil)
+		req.Header.Set("X-Forwarded-For", "203.0.113.9")
+		req.Header.Set("Sec-Fetch-Site", site)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		return w.Code
+	}
+	if probe("cross-site") != 403 || do("/orders/3", "203.0.113.9").Code != 200 {
+		t.Fatal("a cross-site probe banned the visitor")
+	}
+	if probe("same-origin") != 403 || do("/orders/3", "203.0.113.9").Code != 403 {
+		t.Fatal("a probe of its own wasn't banned")
 	}
 	do("/boom/1", "203.0.113.1")
 	p.Flush(context.Background())

@@ -163,7 +163,10 @@ func (f *Firewall) overLimits(key ipKey, limits []*pageLimit, req *preparedReque
 		}
 		name := limit.id + " " + strconv.FormatInt(limit.window, 10) + " " + who
 		if limit.each {
-			name += " " + req.routedPath
+			// Matched on the whole path, counted under its first 2,000
+			// characters: pages alike that far share a count, and a key
+			// stays small however long the path.
+			name += " " + truncate(req.routedPath, maxRuleText)
 		}
 		if f.countLimit(name, window, limit, now, peek) {
 			over = append(over, limit)

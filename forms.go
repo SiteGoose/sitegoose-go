@@ -16,7 +16,18 @@ import (
 	"strings"
 )
 
-var privateField = regexp.MustCompile(`(?i)pass|card|cvc|cvv|secret|token|ssn|iban|csrf|analytics-shield`)
+// privateField: fields never sent, by name. ProtectForm hands over the whole
+// request, so whoever adds it to a sign-up or a checkout route relies on this
+// list: keep it wide, and the same in every package (cc-number and cc-csc
+// are the browser's own autocomplete names). ("pass" also covers passwd
+// and passport.)
+var privateField = regexp.MustCompile(`(?i)pass|pwd|card|cc[-_]?(num|no|number|csc|exp)|cvc|cvv|cvn|expiry|exp[-_]?(month|year|date)|secret|token|\bauth\b|authoriz|api[-_]?key|otp|mfa|2fa|\bpin\b|security[-_]?code|signature|private|ssn|sin\b|nino|tax[-_]?id|iban|bic|swift|routing|account[-_]?(no|num|number)|dob|birth|licen[cs]e|csrf|nonce|analytics-shield`)
+
+// cardDigits: a card number in a field nobody thought to name "card" still
+// must not be sent, so values are checked too: 13-19 digits that pass Luhn
+// are taken out of the text and the rest of the message is kept, so spam is
+// still judged.
+var cardDigits = regexp.MustCompile(`\b(?:\d[ -]?){12,18}\d\b`)
 
 const (
 	maxFormFields = 50
@@ -53,9 +64,37 @@ func plainFields(fields map[string][]string) map[string]string {
 		if privateField.MatchString(name) {
 			continue
 		}
-		out[truncate(name, 100)] = truncate(strings.Join(fields[name], ", "), 2000)
+		out[truncate(name, 100)] = withoutCardNumbers(truncate(strings.Join(fields[name], ", "), 2000))
 	}
 	return out
+}
+
+// withoutCardNumbers replaces anything shaped like a card number, and
+// passing Luhn, with [removed]. Luhn is what keeps order numbers and phone
+// numbers readable.
+func withoutCardNumbers(text string) string {
+	return cardDigits.ReplaceAllStringFunc(text, func(match string) string {
+		sum, alt := 0, false
+		for i := len(match) - 1; i >= 0; i-- {
+			c := match[i]
+			if c < '0' || c > '9' {
+				continue
+			}
+			n := int(c - '0')
+			if alt {
+				n *= 2
+				if n > 9 {
+					n -= 9
+				}
+			}
+			sum += n
+			alt = !alt
+		}
+		if sum%10 == 0 {
+			return "[removed]"
+		}
+		return match
+	})
 }
 
 func checkForm(ctx context.Context, c *core, fields map[string][]string, ip string, o FormOptions) FormResult {

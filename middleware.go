@@ -16,6 +16,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -153,7 +154,7 @@ func (p *Platform) before(r *http.Request) (answer *earlyAnswer, ip, remember st
 	f := p.firewall
 	checked := f != nil && (f.skip == nil || !f.skip(r))
 	in := CheckInput{IP: ip, Method: r.Method, Target: requestTarget(r), UserAgent: r.UserAgent(),
-		Accept: r.Header.Get("Accept"), Cookie: cookieHeader(r.Header)}
+		Accept: r.Header.Get("Accept"), Cookie: cookieHeader(r.Header), SecFetchSite: r.Header.Get("Sec-Fetch-Site")}
 	// The tracker's own addresses, answered before the site: a visitor's
 	// beacon is our traffic, not a page of the site. A denied or banned
 	// address is turned away first, so it can't use us to reach the collector.
@@ -243,17 +244,36 @@ func requestTarget(r *http.Request) string {
 		}
 		return target
 	}
-	// An absolute-form target (a request through a forward proxy): the path on.
-	if !strings.HasPrefix(target, "/") {
-		if i := strings.Index(target, "://"); i >= 0 {
-			rest := target[i+3:]
-			if j := strings.IndexByte(rest, '/'); j >= 0 {
-				return rest[j:]
+	return originForm(target)
+}
+
+var targetScheme = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9+.-]*:`)
+
+// originForm is a request target as net/http routes it: one that doesn't
+// start with "/" (absolute form, or "x:/admin", which ParseRequestURI reads
+// as the path /admin) loses its scheme and, after a "//", its authority, and
+// what is left starts with "/". A rule on "/admin" would miss "x:/admin" as
+// written while the router ran /admin. "*" stays "*".
+func originForm(target string) string {
+	if target == "*" || strings.HasPrefix(target, "/") {
+		return target
+	}
+	rest := target
+	if loc := targetScheme.FindStringIndex(rest); loc != nil {
+		rest = rest[loc[1]:]
+		if strings.HasPrefix(rest, "//") {
+			rest = rest[2:]
+			if i := strings.IndexAny(rest, "/?#"); i >= 0 {
+				rest = rest[i:]
+			} else {
+				rest = ""
 			}
-			return "/"
 		}
 	}
-	return target
+	if !strings.HasPrefix(rest, "/") {
+		rest = "/" + rest
+	}
+	return rest
 }
 
 // Request is the request to hand on: it carries the route, visit and trail.

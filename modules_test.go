@@ -568,3 +568,32 @@ func TestForms(t *testing.T) {
 		t.Fatal(res)
 	}
 }
+
+// ProtectForm hands over the whole form, so the private names are wide and
+// card numbers are taken out of any value (Luhn keeps order numbers).
+func TestFormsLeaveOutPrivateFields(t *testing.T) {
+	private := []string{"password", "pwd", "user_pass", "card_number", "cc-number", "cc_num", "cc-csc", "cc-exp", "cvc", "cvn",
+		"expiry", "exp-month", "exp_year", "client_secret", "api_key", "api-key", "otp", "mfa_code", "2fa", "pin", "security-code",
+		"signature", "private_note", "ssn", "nino", "tax-id", "iban", "bic", "swift", "routing", "account-number", "dob",
+		"birthday", "licence", "license", "csrf_token", "nonce", "auth", "authorization", "analytics-shield"}
+	public := []string{"name", "email", "message", "pinned", "spin", "author", "company", "phone", "order"}
+	fields := map[string][]string{}
+	for _, name := range append(append([]string{}, private...), public...) {
+		fields[name] = []string{"x"}
+	}
+	fields["message"] = []string{"card 4111 1111 1111 1111 or 4111-1111-1111-1111, order 1234567890123"}
+	plain := plainFields(fields)
+	for _, name := range private {
+		if _, sent := plain[name]; sent {
+			t.Errorf("%s was sent", name)
+		}
+	}
+	for _, name := range public {
+		if _, sent := plain[name]; !sent {
+			t.Errorf("%s was left out", name)
+		}
+	}
+	if got := plain["message"]; got != "card [removed] or [removed], order 1234567890123" {
+		t.Fatal(got)
+	}
+}

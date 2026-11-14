@@ -72,6 +72,10 @@ type CheckInput struct {
 	UserAgent string
 	Accept    string
 	Cookie    string
+	// SecFetchSite is the Sec-Fetch-Site header: "cross-site" or "same-site"
+	// is a request another page made the browser send, refused but never
+	// banned (crossSite).
+	SecFetchSite string
 }
 
 // FirewallOptions configure the firewall module.
@@ -644,9 +648,8 @@ var (
 // file: one with a "." or ".." segment, a ";", a "\", an encoded "/" or a
 // "%xx" left after decoding is a page, so "/static/../login",
 // "/static%2F..%2Flogin", "/login;x.css" and "/login%3Bx.css" all count. A
-// browser asks for its files with none of those. Nor is a path past the
-// rules' 2,000 characters a file: cut there, "/search/xxx…x.css/more" would
-// end in .css and flood a catch-all route past the limits. Only GET and HEAD
+// browser asks for its files with none of those. Nor is a path past 2,000
+// characters a file: no asset has a name that long. Only GET and HEAD
 // fetch a file (no method given is read as GET): a form posts to a page, and
 // some routers read /login.css as /login.
 func staticAsset(target, method string) bool {
@@ -721,6 +724,17 @@ func isProbe(target string, p *probeRule) bool {
 	return false
 }
 
+// crossSite: another site made the browser send this request (an <img> of
+// /.env, a no-cors fetch, a link), from the visitor's own address. A probe,
+// a request rule or the rate still refuses it, but it bans no one here, and
+// it is reported as watched, so the collector bans it nowhere else and
+// counts it toward nothing shared (firewall.md, "Checking a request"). A
+// client that forges the header only gives up the ban.
+func crossSite(secFetchSite string) bool {
+	site := strings.TrimSpace(secFetchSite)
+	return strings.EqualFold(site, "cross-site") || strings.EqualFold(site, "same-site")
+}
+
 // Check decides on one request. Allowed addresses skip every other rule.
 // Accept and Cookie (the request's headers) are for the browser check: rule
 // "challenge", status 503, answered with the check page.
@@ -749,12 +763,14 @@ func (f *Firewall) check(in CheckInput, now time.Time) Decision {
 	if mode == "block" {
 		action = "block"
 	}
+	// Refused as below, but never banned (crossSite).
+	bans := !crossSite(in.SecFetchSite)
 	rule := f.addressRule(rules, key)
 	if rule == "" && isProbe(in.Target, rules.probes) {
 		rule = "probe"
 		// Asking for a secret file: banned here in block mode; the report
 		// bans it on the other servers.
-		if action == "block" {
+		if action == "block" && bans {
 			f.banHere(key, rules.probes.ban)
 		}
 	}
@@ -770,7 +786,7 @@ func (f *Firewall) check(in CheckInput, now time.Time) Decision {
 			if !(action == "block" && matched.action == "block") {
 				action = "monitor"
 			}
-			if action == "block" && matched.ban > 0 {
+			if action == "block" && matched.ban > 0 && bans {
 				f.banHere(key, matched.ban)
 			}
 		}
@@ -779,6 +795,11 @@ func (f *Firewall) check(in CheckInput, now time.Time) Decision {
 		path := in.Target
 		if i := strings.IndexByte(path, '?'); i >= 0 {
 			path = path[:i]
+		}
+		// What another site made the browser send is reported as watched,
+		// so the report bans it on no other server.
+		if !bans && act == "block" && (name == "probe" || name == "rate" || strings.HasPrefix(name, "request:")) {
+			act = "monitor"
 		}
 		return firewallEvent{IP: in.IP, Rule: name, Action: act, Method: truncate(in.Method, 10),
 			Path: truncate(path, 300), UserAgent: truncate(in.UserAgent, 300)}
@@ -819,7 +840,7 @@ func (f *Firewall) check(in CheckInput, now time.Time) Decision {
 		rule, retryAfter = "rate", rules.rate.window
 		// Banned here straight away in block mode, as a probe is; the report
 		// bans it on the other servers.
-		if action == "block" {
+		if action == "block" && bans {
 			f.banHere(key, rules.ban)
 		}
 	}

@@ -36,6 +36,9 @@ type ruleSection struct {
 	suffix   []string
 	contains []string
 	regex    *regexp.Regexp
+	// The pattern begins with "^" or ends with "$": searched only in the
+	// window that starts or ends the part (regexHits).
+	regexStart, regexEnd bool
 }
 
 type requestRule struct {
@@ -242,6 +245,18 @@ func freeRepeats(p string) int {
 	return free
 }
 
+// endsWithAnchor: the pattern ends with "$", not an escaped "\$".
+func endsWithAnchor(pattern string) bool {
+	if !strings.HasSuffix(pattern, "$") {
+		return false
+	}
+	escapes := 0
+	for i := len(pattern) - 2; i >= 0 && pattern[i] == '\\'; i-- {
+		escapes++
+	}
+	return escapes%2 == 0
+}
+
 func lowerList(entries []any, allowEmpty bool) []string {
 	var out []string
 	for _, e := range entries {
@@ -284,6 +299,8 @@ func compileSection(raw any) *ruleSection {
 		// A pattern we can't compile is dropped; the rule's other parts stay.
 		if re, err := regexp.Compile("(?i)" + pattern); err == nil {
 			out.regex = re
+			out.regexStart = strings.HasPrefix(pattern, "^")
+			out.regexEnd = endsWithAnchor(pattern)
 			found = true
 		}
 	}
@@ -433,7 +450,7 @@ func normalizeTarget(target string) string {
 	if loc := queryOrFragment.FindStringIndex(target); loc != nil {
 		target = target[:loc[0]]
 	}
-	return truncate(routerPath(truncate(target, maxRuleText)), maxRuleText)
+	return routerPath(target)
 }
 
 func (s *ruleSection) hits(forms ...string) bool {
@@ -464,41 +481,95 @@ func (s *ruleSection) hits(forms ...string) bool {
 				return true
 			}
 		}
-		if s.regex != nil && s.regex.MatchString(text) {
+		if s.regex != nil && s.regexHits(text) {
 			return true
 		}
 	}
 	return false
 }
 
+// regexWindow is the regex's share of a part, in characters: the plain
+// matchers run over the whole part, a regex over windows of this many that
+// start every half window, so a match up to half a window long is found
+// wherever it sits (firewall.md, "Request rules"). RE2 is linear anyway;
+// the windows are so every client finds the same matches.
+const regexWindow = maxRuleText
+
+// regexHits searches text in its first window, then in each window
+// starting half a window later, until one reaches the end. A window's edges
+// aren't the part's: "^" is searched only in the first, "$" only in the last.
+func (s *ruleSection) regexHits(text string) bool {
+	if len(text) <= regexWindow {
+		return s.regex.MatchString(text)
+	}
+	// Byte offsets of every half window's start.
+	step := regexWindow / 2
+	var marks []int
+	count := 0
+	for i := range text {
+		if count%step == 0 {
+			marks = append(marks, i)
+		}
+		count++
+	}
+	if count <= regexWindow {
+		return s.regex.MatchString(text)
+	}
+	offset := func(chars int) int {
+		if chars >= count {
+			return len(text)
+		}
+		return marks[chars/step]
+	}
+	for start := 0; ; start += step {
+		end := start + regexWindow
+		if end > count {
+			end = count
+		}
+		last := end == count
+		if (start == 0 || !s.regexStart) && (last || !s.regexEnd) && s.regex.MatchString(text[offset(start):offset(end)]) {
+			return true
+		}
+		if last {
+			return false
+		}
+	}
+}
+
 // preparedRequest is a request's parts, prepared once for every request rule
 // and page limit: the method upper-cased, the path raw, decoded and routed,
-// the query raw and decoded, the user agent.
+// the query raw and decoded, the user agent. Whole, however long: 2,000
+// characters of filler mustn't carry an attack past a rule.
 type preparedRequest struct {
 	method, rawPath, decodedPath, routedPath, rawQuery, decodedQuery, ua string
 }
 
 // prepareRequest: target is the request target as the server received it,
-// query string and all.
+// query string and all. A "#" ends the path and the query: a raw client
+// can send one, and the router never sees what follows it.
 func prepareRequest(method, target, userAgent string) *preparedRequest {
 	pathPart, query := target, ""
-	if i := strings.IndexByte(target, '?'); i >= 0 {
-		pathPart, query = target[:i], target[i+1:]
+	if i := strings.IndexAny(target, "?#"); i >= 0 {
+		pathPart = target[:i]
+		if target[i] == '?' {
+			query = target[i+1:]
+			if j := strings.IndexByte(query, '#'); j >= 0 {
+				query = query[:j]
+			}
+		}
 	}
-	pathPart = truncate(pathPart, maxRuleText)
-	query = truncate(query, maxRuleText)
 	return &preparedRequest{
 		method:      strings.ToUpper(method),
 		rawPath:     normalizeRulePath(pathPart),
-		decodedPath: normalizeRulePath(truncate(decodeOnce(pathPart), maxRuleText)),
+		decodedPath: normalizeRulePath(decodeOnce(pathPart)),
 		// And as the router reads it: "/x;y/../admin" is "/admin" there, so a
 		// rule on "/admin" catches it; a hit on any of the three counts.
-		routedPath: truncate(routerPath(pathPart), maxRuleText),
+		routedPath: routerPath(pathPart),
 		rawQuery:   strings.ToLower(query),
 		// Lower-cased after decoding: %55NION decodes to "UNION", which a
 		// lower-cased "union select" rule would otherwise never see.
-		decodedQuery: strings.ToLower(truncate(decodeOnce(query), maxRuleText)),
-		ua:           strings.ToLower(truncate(userAgent, maxRuleText)),
+		decodedQuery: strings.ToLower(decodeOnce(query)),
+		ua:           strings.ToLower(userAgent),
 	}
 }
 

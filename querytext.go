@@ -67,6 +67,42 @@ var (
 		jsSpaceClass[1:len(jsSpaceClass)-1] + `]+))?(?: ((?s:.)*))?$`)
 )
 
+// valueQuotes: where "..." may hold a value rather than a name. SQLite takes
+// a double-quoted string as a literal when no column has that name
+// (SQLCipher's PRAGMA key = "x'2DD2…'"), Oracle writes a password as a
+// quoted name, and an unknown database may do either. There "..." is kept
+// only when it reads as a plain name, closed: "email", never "x'2D…'",
+// "N3w P@ss" or an unclosed one.
+var (
+	valueQuotes = map[string]bool{"sqlite": true, "oracle": true, "other": true}
+	quotedName  = regexp.MustCompile(`^"[A-Za-z_][A-Za-z0-9_$#]{0,127}"$`)
+)
+
+// A password or key written as a name, on any database: Oracle's
+// ALTER USER u IDENTIFIED BY pw and SQLCipher's PRAGMA key = "passphrase".
+// What follows is "?" whether it was a word or a quoted name. The keywords
+// are spelled out in both cases rather than (?i), which in Go also folds
+// the Kelvin sign into k, as JavaScript's /i doesn't.
+var (
+	secretName   = `("(?:[^"]|"")*"?|` + "`(?:[^`]|``)*`?" + `|[^` + jsSpaceClass[1:len(jsSpaceClass)-1] + `;,()]+)`
+	identifiedBy = regexp.MustCompile(`(\b` + anyCase("IDENTIFIED BY ") + `)` + secretName)
+	pragmaKey    = regexp.MustCompile(`(\b` + anyCase("PRAGMA ") + `(?:[A-Za-z_][A-Za-z0-9_]*\.)?(?:` + anyCase("HEX") + `)?(?:` +
+		anyCase("RE") + `)?` + anyCase("KEY") + ` ?[=(] ?)` + secretName)
+)
+
+// anyCase is an ASCII word as a pattern that takes it in either case.
+func anyCase(word string) string {
+	var b strings.Builder
+	for _, c := range word {
+		if c >= 'A' && c <= 'Z' {
+			b.WriteString("[" + string(c) + string(c+32) + "]")
+		} else {
+			b.WriteRune(c)
+		}
+	}
+	return b.String()
+}
+
 func qTrimJS(s string) string { return strings.TrimFunc(s, qJsSpace) }
 
 func qIsDigit(c rune) bool { return c >= '0' && c <= '9' }
@@ -258,7 +294,11 @@ func sqlShapeAs(sql, db string, literal bool) string {
 			out = append(out, '?')
 		case c == '"' || c == '`':
 			end := qQuoteEnd(r, i, c, !literal)
-			out = append(out, r[i:end]...)
+			if c == '"' && valueQuotes[db] && !quotedName.MatchString(string(r[i:end])) {
+				out = append(out, '?')
+			} else {
+				out = append(out, r[i:end]...)
+			}
 			i = end
 		case c == '$' && !qIsWord(prev) && qDollarTag(r, i) > 0:
 			n := qDollarTag(r, i)
@@ -279,7 +319,9 @@ func sqlShapeAs(sql, db string, literal bool) string {
 			i++
 		}
 	}
-	s := placeholderList.ReplaceAllString(string(out), "(?)")
+	s := identifiedBy.ReplaceAllString(string(out), "${1}?")
+	s = pragmaKey.ReplaceAllString(s, "${1}?")
+	s = placeholderList.ReplaceAllString(s, "(?)")
 	return qTrimJS(placeholderRows.ReplaceAllString(s, "(?)"))
 }
 

@@ -100,6 +100,148 @@ func TestRequestTargetIsTheRawTarget(t *testing.T) {
 	}
 }
 
+// Every target in the shared cases, as net/http routes it: "x:/admin" is
+// /admin to ServeMux, so it is /admin to the rules too.
+func TestSharedTargets(t *testing.T) {
+	var cases struct {
+		Targets []struct {
+			Target string `json:"target"`
+			Origin string `json:"origin"`
+		} `json:"targets"`
+	}
+	readShared(t, "request-rules-cases.json", &cases)
+	if len(cases.Targets) == 0 {
+		t.Fatal("no targets")
+	}
+	r := httptest.NewRequest("GET", "/", nil)
+	for _, c := range cases.Targets {
+		if got := originForm(c.Target); got != c.Origin {
+			t.Errorf("%q: %q, want %q", c.Target, got, c.Origin)
+		}
+		if c.Target == "*" {
+			continue
+		}
+		r.RequestURI = c.Target
+		if got := requestTarget(r); got != c.Origin {
+			t.Errorf("requestTarget %q: %q, want %q", c.Target, got, c.Origin)
+		}
+	}
+	rules := compileRequestRules(map[string]any{"rules": []any{
+		map[string]any{"id": "admin", "action": "block", "path": map[string]any{"prefix": []any{"/admin"}}},
+	}})
+	r.RequestURI = "x:/admin/export"
+	if matchRequest(rules, "GET", requestTarget(r), "") == nil {
+		t.Fatal("x:/admin/export got past a rule on /admin")
+	}
+}
+
+// A regex is searched in windows of 2,000 characters every 1,000; "^" only
+// in the first, "$" only in the last. The plain matchers read it all.
+func TestRegexWindows(t *testing.T) {
+	section := func(pattern string) *ruleSection {
+		s := compileSection(map[string]any{"regex": pattern})
+		if s == nil {
+			t.Fatal(pattern)
+		}
+		return s
+	}
+	pad := strings.Repeat("x", 3500)
+	for _, c := range []struct {
+		pattern, text string
+		want          bool
+	}{
+		{"evil", "evil", true},
+		{"evil", pad + "evil" + pad, true},
+		{"evil", strings.Repeat("é", 2500) + "evil", true},
+		{"^evil", "evil" + pad, true},
+		{"^evil", pad + "evil", false},
+		{"^evil", "x" + "evil", false},
+		{"evil$", pad + "evil", true},
+		{"evil$", "evil" + pad, false},
+		{`evil\$`, pad + "evil$" + pad, true},
+		{"^evil$", "evil", true},
+		{"^x+$", pad, false},
+		{"^x+$", strings.Repeat("x", 2000), true},
+		// A match that spans a window's edge is still inside the next one.
+		{"a.{900}b", strings.Repeat("x", 1500) + "a" + strings.Repeat("y", 900) + "b" + pad, true},
+	} {
+		if got := section(c.pattern).hits(c.text); got != c.want {
+			t.Errorf("%q in %d characters: %v, want %v", c.pattern, len([]rune(c.text)), got, c.want)
+		}
+	}
+	plain := compileSection(map[string]any{"exact": []any{pad}, "suffix": []any{".php"}})
+	if !plain.hits(pad) || !plain.hits(pad+"/x.php") {
+		t.Fatal("a plain matcher stopped at 2,000 characters")
+	}
+}
+
+// What another site made the browser send is refused, but bans no one and
+// is reported as watched (firewall.md, "Checking a request").
+func TestCrossSiteRequestsAreRefusedNotBanned(t *testing.T) {
+	data := map[string]any{"v": 1, "enabled": true, "mode": "block",
+		"probes":   map[string]any{"exact": []any{"/.env"}, "ban": 600},
+		"rate":     map[string]any{"limit": 2, "window": 60},
+		"ban":      map[string]any{"seconds": 600},
+		"requests": map[string]any{"rules": []any{map[string]any{"id": "shell", "action": "block", "ban": 600, "path": map[string]any{"exact": []any{"/shell.php"}}}}},
+	}
+	actions := func(f *Firewall) map[string]string {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		out := map[string]string{}
+		for _, e := range f.queue {
+			out[e.Rule] = e.Action
+		}
+		return out
+	}
+	for _, site := range []string{"cross-site", "Same-Site"} {
+		f := testFirewall(t, "s", data, FirewallOptions{})
+		for _, target := range []string{"/.env", "/shell.php"} {
+			if d := f.Check(CheckInput{IP: "6.6.6.6", Method: "GET", Target: target, SecFetchSite: site}); d.Action != "block" || d.Status != 403 {
+				t.Fatalf("%s %s: %+v", site, target, d)
+			}
+		}
+		var last Decision
+		for i := 0; i < 3; i++ {
+			last = f.Check(CheckInput{IP: "6.6.6.7", Method: "GET", Target: "/", SecFetchSite: site})
+		}
+		if last.Rule != "rate" || last.Action != "block" || last.Status != 429 {
+			t.Fatalf("%s: %+v", site, last)
+		}
+		if f.bannedHere(mustKey(t, "6.6.6.6")) || f.bannedHere(mustKey(t, "6.6.6.7")) {
+			t.Fatalf("%s: banned", site)
+		}
+		got := actions(f)
+		if got["probe"] != "monitor" || got["request:shell"] != "monitor" || got["rate"] != "monitor" {
+			t.Fatalf("%s: reported %v", site, got)
+		}
+	}
+	// same-origin, none or no header: banned and reported as before.
+	for _, site := range []string{"same-origin", "none", ""} {
+		f := testFirewall(t, "s", data, FirewallOptions{})
+		f.Check(CheckInput{IP: "6.6.6.6", Method: "GET", Target: "/.env", SecFetchSite: site})
+		if !f.bannedHere(mustKey(t, "6.6.6.6")) || actions(f)["probe"] != "block" {
+			t.Fatalf("%q: not banned, reported %v", site, actions(f))
+		}
+	}
+}
+
+// The middleware hands the firewall the request's Sec-Fetch-Site.
+func TestMiddlewareCarriesSecFetchSite(t *testing.T) {
+	p := checkPlatform(t, nil, map[string]any{"mode": "block", "probes": map[string]any{"exact": []any{"/.env"}, "ban": 600}})
+	defer p.Close(context.Background())
+	h := p.Middleware(theSite)
+	if res := call(h, "GET", "/.env", "image/*", map[string][]string{"Sec-Fetch-Site": {"cross-site"}}); res.StatusCode != 403 {
+		t.Fatal(res.StatusCode)
+	}
+	if res := call(h, "GET", "/", "text/html", nil); res.StatusCode != 200 {
+		t.Fatal("banned by a cross-site request", res.StatusCode)
+	}
+	call(h, "GET", "/.env", "*/*", nil)
+	if res := call(h, "GET", "/", "text/html", nil); res.StatusCode != 403 {
+		t.Fatal("a probe of its own wasn't banned", res.StatusCode)
+	}
+}
+
 func TestCloudflareRangesMatchTheSharedList(t *testing.T) {
 	var shared struct {
 		Ranges []string `json:"ranges"`
