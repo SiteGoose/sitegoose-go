@@ -727,7 +727,7 @@ func isProbe(target string, p *probeRule) bool {
 // crossSite: another site made the browser send this request (an <img> of
 // /.env, a no-cors fetch, a link), from the visitor's own address. A probe,
 // a request rule or the rate still refuses it, but it bans no one here, and
-// it is reported as watched, so the collector bans it nowhere else and
+// it is reported as refused, so the collector bans it nowhere else and
 // counts it toward nothing shared (firewall.md, "Checking a request"). A
 // client that forges the header only gives up the ban.
 func crossSite(secFetchSite string) bool {
@@ -796,10 +796,10 @@ func (f *Firewall) check(in CheckInput, now time.Time) Decision {
 		if i := strings.IndexByte(path, '?'); i >= 0 {
 			path = path[:i]
 		}
-		// What another site made the browser send is reported as watched,
+		// What another site made the browser send is reported as refused,
 		// so the report bans it on no other server.
 		if !bans && act == "block" && (name == "probe" || name == "rate" || strings.HasPrefix(name, "request:")) {
-			act = "monitor"
+			act = "refused"
 		}
 		return firewallEvent{IP: in.IP, Rule: name, Action: act, Method: truncate(in.Method, 10),
 			Path: truncate(path, 300), UserAgent: truncate(in.UserAgent, 300)}

@@ -127,8 +127,12 @@ func checkForm(ctx context.Context, c *core, fields map[string][]string, ip stri
 		Success *bool    `json:"success"`
 		Reasons []string `json:"reasons"`
 	}
-	res.json(&data)
-	spam := data.Success != nil && !*data.Success
+	// A verdict, spam or not, is always a 200 with `success`. Anything else
+	// judged nothing, and must not look like protection that works.
+	if res.status != http.StatusOK || !res.json(&data) || data.Success == nil {
+		return unchecked
+	}
+	spam := !*data.Success
 	reasons := data.Reasons
 	if reasons == nil {
 		reasons = []string{}

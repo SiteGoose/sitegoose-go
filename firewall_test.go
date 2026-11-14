@@ -211,7 +211,7 @@ func TestCrossSiteRequestsAreRefusedNotBanned(t *testing.T) {
 			t.Fatalf("%s: banned", site)
 		}
 		got := actions(f)
-		if got["probe"] != "monitor" || got["request:shell"] != "monitor" || got["rate"] != "monitor" {
+		if got["probe"] != "refused" || got["request:shell"] != "refused" || got["rate"] != "refused" {
 			t.Fatalf("%s: reported %v", site, got)
 		}
 	}

@@ -567,6 +567,16 @@ func TestForms(t *testing.T) {
 	if res := p.CheckForm(nil, FormOptions{Fields: map[string][]string{"a": {"b"}}}); !res.OK || res.Checked || res.Reasons[0] != "unchecked" {
 		t.Fatal(res)
 	}
+	// Only a 200 that says success true or false is a verdict.
+	for _, answer := range []struct {
+		status int
+		body   map[string]any
+	}{{400, map[string]any{"error": "bad"}}, {200, map[string]any{"reasons": []any{}}}} {
+		c.json("/collectanalytics/shield/verify", answer.status, answer.body)
+		if res := p.CheckForm(nil, FormOptions{Fields: map[string][]string{"a": {"b"}}}); !res.OK || res.Checked || res.Reasons[0] != "unchecked" {
+			t.Fatal(answer, res)
+		}
+	}
 }
 
 // ProtectForm hands over the whole form, so the private names are wide and
